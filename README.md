@@ -92,8 +92,11 @@ profile 的 `package.json` 加一条依赖，再 `pnpm install`：
 
 ## 自检
 
+依赖没提交进 git（`node_modules/` 已忽略），第一次跑先装：
+
 ```bash
-node test/selftest.mjs
+pnpm install
+node test/selftest.mjs   # 期望输出 auto-continue selftest: all assertions passed
 ```
 
 覆盖：默认配置、user/hook 不续、parent 续一条、`kinds` 里的 error/interrupted 续、

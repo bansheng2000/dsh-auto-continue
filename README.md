@@ -68,13 +68,27 @@ raw node http，`res.writeHead()/res.end()`。
 
 ## 安装
 
-```bash
-pnpm link --dir .            # 或 dsh plugin --profile <profile> add <path>
+profile 的 `package.json` 加一条依赖，再 `pnpm install`：
+
+```json
+"dsh-auto-continue": "github:bansheng2000/dsh-auto-continue"
 ```
 
-然后确认 profile 的 `package.json` 里有 `dsh-auto-continue` 依赖 + `dsh.profile.bundles` 条目，
-`cordis.patch.yml` 有 `auto-continue` 行。本仓库已接进
-`C:\Users\12576\.dsh\profiles\desktop`（node_modules 下是指向本目录的 junction，改源码即生效）。
+本地开发则写 `"dsh-auto-continue": "file:/绝对/路径/dsh-auto-continue"`。
+装完确认 profile 的 `dsh.profile.bundles` 里有 `dsh-auto-continue`，且 `cordis.patch.yml`
+落到了 loader 行（bundle 自带的 patch 用 `- insert:` 建行；扁平 `- id:` 只改已有条目配置，
+条目不存在时是空操作，插件会静默不挂载）。要求宿主 DSH ≥ `0.1.7-rc.1`（见 `package.json` 的 `dsh.engines`）。
+
+两个坑：
+- pnpm 装进 profile 的 `node_modules` 是**真实拷贝，不是软链**：改了远端或本地源码都要重装（或手工同步）才生效。
+- 改完代码要**重启宿主**，插件是启动时加载的。
+
+### 更新
+
+1. 改代码 → 改 `package.json` 的 `version` → commit → push（顺手打 tag `vX.Y.Z`）；
+2. 另一台机器 `pnpm update dsh-auto-continue`。裸 `github:` 规格会重新解析默认分支最新提交；
+   想按版本号升级，规格写成 `github:bansheng2000/dsh-auto-continue#semver:^0.1.0`，再配合 tag；
+3. 重启宿主。
 
 ## 自检
 
@@ -82,5 +96,6 @@ pnpm link --dir .            # 或 dsh plugin --profile <profile> add <path>
 node test/selftest.mjs
 ```
 
-覆盖：默认配置、user/hook 不续、parent 续一条、其它 turn/end reason 不续、
-maxRetries 封顶、拿不到 agent 不耗配额、enabled=false、自定义 causes、畸形 payload、多会话隔离。
+覆盖：默认配置、user/hook 不续、parent 续一条、`kinds` 里的 error/interrupted 续、
+`completed`/`blocked` 不续、`kinds` 覆盖生效、maxRetries 封顶、拿不到 agent 不耗配额、
+enabled=false、自定义 `causes`、畸形 payload、多会话隔离。

@@ -1,0 +1,38 @@
+# dsh-auto-continue — 异常中断自动继续
+#
+# 注册一个条目 `auto-continue`。默认 enabled=true，装上即生效：
+# 只有「非正常中断」才会被补一句「继续」，用户自己点的终止一律不管。
+#
+# 判定依据是宿主 loop 的 abort cause（`AgentCancelCause`）：
+#   user     用户自己点的终止（sessionController.cancel → agent.cancel({kind:'user'})）
+#   parent   父级/上级停的
+#   disposed 会话被释放
+#   hook     插件通过 cancel({kind:'hook'}) 停的
+#   legacy   旧格式/无法归类
+# 默认把 parent / disposed / legacy / unknown 当异常，user 与 hook 不动。
+#
+# 配置写在本条目的 config 里（优先级最低，可被设置卡片覆盖）：
+#   rules:
+#     enabled: true
+#     causes: [parent, disposed, legacy, unknown]
+#     prompt: "继续"
+#     maxRetries: 3
+# prompt 是补发的那句话；maxRetries 是同一会话最多自动续几次，防 runaway。
+#
+# 用 `- insert:` 包裹：bundle patch 里顶层 `- id:` 只会被 loader 当成
+# 「改已有条目配置」，条目不存在时是空操作（plugin_manager list_bundles 会把
+# 它列进 overrides 而不是 rows）——插件根本挂不上。必须 insert 出新行。
+# profile 自己的 cordis.patch.yml 里那条扁平 `- id: auto-continue` 才是配置覆盖层。
+- insert:
+    - id: auto-continue
+      name: dsh-auto-continue
+      config:
+        rules:
+          enabled: true
+          prompt: "继续"
+          maxRetries: 3
+          causes:
+            - parent
+            - disposed
+            - legacy
+            - unknown

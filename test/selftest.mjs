@@ -42,11 +42,12 @@ function configWith(overrides = {}) {
   return { rules: { ...overrides } };
 }
 
-// 1) 配置解析：缺省 = 开，causes 覆盖四个异常 kind，prompt=继续，maxRetries=3
+// 1) 配置解析：缺省 = 开，causes 覆盖四个异常 abort cause，kinds 覆盖三种非 aborted 异常，prompt=继续，maxRetries=3
 {
   const rules = rulesOf({});
   assert.equal(rules.enabled, true);
   assert.deepEqual(rules.causes, ["parent", "disposed", "legacy", "unknown"]);
+  assert.deepEqual(rules.kinds, ["error", "interrupted", "max-tokens"]);
   assert.equal(rules.prompt, "继续");
   assert.equal(rules.maxRetries, 3);
 }
@@ -95,19 +96,37 @@ function configWith(overrides = {}) {
   }, "消息应被冻结，避免被下游改写");
 }
 
-// 6) 正常 completed / error / max-tokens → 不动
+// 6) completed / blocked / forked → 不动；error / max-tokens / interrupted → 补「继续」
+//    （依据 session log 实测：真实事故是 429/502 的 error 与崩后恢复的 interrupted）
+for (const reason of [{ kind: "completed" }, { kind: "blocked" }, { kind: "forked" }]) {
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith());
+  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, reason));
+  assert.equal(sink.length, 0, `${reason.kind} 不该补消息`);
+}
 for (const reason of [
-  { kind: "completed" },
-  { kind: "error", error: { message: "boom", code: "X" } },
+  { kind: "error", error: { message: "429 rate limit", code: "RATE_LIMIT" } },
   { kind: "max-tokens" },
-  { kind: "blocked" },
   { kind: "interrupted" },
 ]) {
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
   ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, reason));
-  assert.equal(sink.length, 0, `${reason.kind} 不该补消息`);
+  assert.equal(sink.length, 1, `${reason.kind} 应补一条「继续」`);
+  assert.equal(sink[0].content[0].text, "继续");
+}
+
+// 6b) kinds 可自定义：只续 error，不续 interrupted
+{
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith({ kinds: ["error"] }));
+  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(1, { kind: "interrupted" }));
+  assert.equal(sink.length, 0, "自定义 kinds 之外的 kind 不补");
+  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(2, { kind: "error", error: { message: "502" } }));
+  assert.equal(sink.length, 1, "kinds 里的 error 应补");
 }
 
 // 7) 非 turn/end 事件被忽略

@@ -1,6 +1,6 @@
 # dsh-auto-continue — 异常中断自动继续
 
-对话被**非正常中断**（父级停止、归档、会话释放、未知原因）时，自动补一句「继续」把任务接着跑；
+对话被**非正常中断**（轮次报错如 429/502、进程崩溃后恢复、输出被 max-tokens 截断，以及父级停止、归档、会话释放、未知原因）时，自动补一句「继续」把任务接着跑；
 **用户自己点的终止**（cancel cause `kind === "user"`）一律不动。
 
 ## 判定依据（从 app.asar 反查确认）
@@ -26,6 +26,15 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 `agent/error` 不带 cause（只是个 re-broadcast），`api-session/error` 也不带——
 `session/event` 的 `turn/end` 是唯一把 cause 递到插件面前的通道。
 
+`reason.kind` 不是 `aborted` 的轮次另有三种，按 `rules.kinds` 判（session log 实测：打断会话的其实是这三种，不是 aborted）：
+
+| reason.kind | 含义 | 默认动作 |
+|---|---|---|
+| `error` | LLM 报错把轮次打死（429 限流、502 上游失败等） | 续 |
+| `interrupted` | 上次进程崩在轮次中途，恢复时补的 turn closer | 续 |
+| `max-tokens` | 输出被截断，任务没做完 | 续 |
+| `completed` / `blocked` / `forked` | 正常完成 / 权限或 hook 拦下 / 用户分叉 | **不管** |
+
 ## 继续的投递口
 
 `turn/end` 之后 inbox 已被 cancel 清空（`keepInbox: false` 时连排队输入一起丢），
@@ -43,6 +52,7 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 |---|---|---|
 | `rules.enabled` | `true` | 装上即生效；关掉后只留状态查询 |
 | `rules.causes` | `["parent","disposed","legacy","unknown"]` | 哪些 abort cause 算异常 |
+| `rules.kinds` | `["error","interrupted","max-tokens"]` | 哪些非 aborted 的 turn/end reason 算异常 |
 | `rules.prompt` | `"继续"` | 补发的那句话 |
 | `rules.maxRetries` | `3` | 同一会话最多自动续几次，防 runaway |
 
@@ -50,7 +60,9 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 
 ## 状态查询
 
-`GET /_auto-continue/status` → `{ active, continued, lastReason, attempts }`。
+`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, attempts }`。
+`seen`/`lastSeen` 是观测口：宿主每发一个 `turn/end` 就计数、记下 `sessionId/turn/reason`，
+用来证明监听确实挂上了（而不是判定把事件放过了）。
 路由按宿主 `WebRoute` 契约注册：`{ kind: "exact", path, handler(req, res) }`，
 raw node http，`res.writeHead()/res.end()`。
 

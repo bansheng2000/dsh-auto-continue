@@ -44,6 +44,13 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 消息自己造，形状与宿主 `createUserMessage` 一致（`deepFreeze(structuredClone({id, role:'user', content, source}))`），
 不为此引入 `@deepseek-ai/dsh-llm` 依赖。
 
+拿 agent 的姿势有个硬要求：**`agents` 必须写进插件导出的 `inject`**（本插件是 `const inject = ["agents"]`），
+否则宿主 ctx 上根本没有 `ctx.agents`，`ctx.agents?.get?.(id)` 恒为 `undefined`，
+每次异常都停在「no live agent」，表现就是「中断了没有发继续」。
+同类在役写法：`dsh-memory-evolve/lib/index.js:76` 的 `inject = ['tools', …, 'agents', …]`、
+`dsh-prompt-optimizer/lib/index.js:112` 的 `ctx.inject([…, "agents", …], (sctx) => …)`。
+取值走 `ctx.get("agents") ?? ctx.agents` 双路。
+
 ## 配置
 
 写在 loader entry `auto-continue` 的 config 里（优先级最低，可被设置卡片覆盖）：
@@ -60,9 +67,11 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 
 ## 状态查询
 
-`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, attempts }`。
+`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, attempts }`。
 `seen`/`lastSeen` 是观测口：宿主每发一个 `turn/end` 就计数、记下 `sessionId/turn/reason`，
 用来证明监听确实挂上了（而不是判定把事件放过了）。
+`lastSkip` 记「本该续但没续」的原因（`no-live-agent` / `agent-has-no-followup` / `followup-failed: …`）——
+没有这个字段时，「中断没续」只能靠猜。
 路由按宿主 `WebRoute` 契约注册：`{ kind: "exact", path, handler(req, res) }`，
 raw node http，`res.writeHead()/res.end()`。
 
@@ -79,9 +88,10 @@ profile 的 `package.json` 加一条依赖，再 `pnpm install`：
 落到了 loader 行（bundle 自带的 patch 用 `- insert:` 建行；扁平 `- id:` 只改已有条目配置，
 条目不存在时是空操作，插件会静默不挂载）。要求宿主 DSH ≥ `0.1.7-rc.1`（见 `package.json` 的 `dsh.engines`）。
 
-两个坑：
+三个坑：
 - pnpm 装进 profile 的 `node_modules` 是**真实拷贝，不是软链**：改了远端或本地源码都要重装（或手工同步）才生效。
-- 改完代码要**重启宿主**，插件是启动时加载的。
+- 改完代码要**重启宿主**，插件是启动时加载的（改文件本身不会热重载；`plugin_manager` 关掉再打开 bundle 会让 entry 重建，但 ESM 模块缓存还在，仍是旧代码）。
+- 忘写 `inject: ["agents"]` 不会报错，只会静默不续（见上「继续的投递口」）。
 
 ### 更新
 

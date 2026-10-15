@@ -5,9 +5,16 @@ import assert from "node:assert/strict";
 const mod = await import("../lib/index.js");
 const { apply, rulesOf, resolveConfig } = mod;
 
+// 0) 必须在 inject 里声明 agents，否则宿主 ctx 上根本没有 ctx.agents —— 续不了。
+assert.ok(mod.inject.includes("agents"), "inject 必须声明 agents（ctx.agents 才会存在）");
+
 /** 造一个最小 ctx：只有 on / inject / agents / logger。 */
 function makeCtx(agentsGet) {
   const listeners = new Map();
+  const registry = agentsGet ? { get: agentsGet } : undefined;
+  // ★ 假 ctx 必须照抄宿主的注入门禁：ctx.agents 只在插件 inject 声明过时才存在。
+  //   否则测试比现实宽松——本地全绿，装机后每次异常都停在「no live agent」。
+  const declared = (mod.inject ?? []).includes("agents");
   const ctx = {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     on: (event, fn) => {
@@ -15,7 +22,8 @@ function makeCtx(agentsGet) {
       listeners.get(event).push(fn);
     },
     inject: () => {},
-    agents: agentsGet ? { get: agentsGet } : undefined,
+    agents: declared ? registry : undefined,
+    get: (name) => (name === "agents" && declared ? registry : undefined),
     _emit: (event, ...args) => {
       for (const fn of listeners.get(event) ?? []) fn(...args);
     },

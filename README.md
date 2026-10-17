@@ -58,12 +58,16 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `rules.enabled` | `true` | 装上即生效；关掉后只留状态查询 |
-| `rules.causes` | `["parent","disposed","legacy","unknown"]` | 哪些 abort cause 算异常 |
-| `rules.kinds` | `["error","interrupted","max-tokens"]` | 哪些非 aborted 的 turn/end reason 算异常 |
+| `rules.causes` | `["parent","disposed","legacy","unknown"]` | 哪些 abort cause 算异常；写 `[]` = 全禁 |
+| `rules.kinds` | `["error","interrupted","max-tokens"]` | 哪些非 aborted 的 turn/end reason 算异常；写 `[]` = 全禁 |
 | `rules.prompt` | `"继续"` | 补发的那句话（去首尾空白；超长截断到 2000 字符） |
-| `rules.maxRetries` | `3` | 同一会话最多自动续几次，防 runaway |
+| `rules.maxRetries` | `3` | 同一会话最多自动续几次（计数按 30 分钟窗口累计、`completed` 时归零），防 runaway |
 
 `user` 恒不算异常——这是需求的第一条，不提供开关。
+空数组 = 全禁（**不是**「回落默认」）：不写这个键才用默认名单，两者含义不同。
+cause 认不出来（`unknown`，即 abort 的 cause 字段缺失或形态不认识）**只续 1 次**，第二次会记进 `lastSkip`——
+既不静默漏掉真异常，也不会把「用户手动停、但 cause 没记上」那种反复续起来。
+反过来，宿主以后新增的**有名字**的 cause 不在默认名单里 → 一次都不续（要续就把它加进 `rules.causes`）。
 第 1 次异常立即续；第 2 次起先退避再续（2s 起、×2 递增、±30% 抖动、上限 30s），
 免得上游 429 时几秒内原地撞满 `maxRetries`（每撞一次都是一轮无效的 LLM 调用）。
 
@@ -73,10 +77,14 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 `seen`/`lastSeen` 是观测口：宿主每发一个 `turn/end` 就计数、记下 `sessionId/turn/reason`，
 用来证明监听确实挂上了（而不是判定把事件放过了）。
 `lastSkip` 记「本该续但没续」的原因（`no-live-agent` / `agent-has-no-followup` /
-`no-live-agent-on-retry` / `already-scheduled` / `followup-failed: …`）——
-没有这个字段时，「中断没续」只能靠猜。
+`no-live-agent-on-retry` / `already-scheduled` / `unknown-cause-already-continued` /
+`followup-failed: …`）——没有这个字段时，「中断没续」只能靠猜。
 路由按宿主 `WebRoute` 契约注册：`{ kind: "exact", path, handler(req, res) }`，
 raw node http，`res.writeHead()/res.end()`。
+**只服务回环**：Host 头不是 `127.0.0.1` / `localhost` / `::1` 一律 403。这条路由是用
+`ctx.webServer.register` 裸注册的，不在宿主 `/api/*` 的浏览器鉴权墙后面，而本机常驻的
+cloudflared 隧道会把公网请求以 `127.0.0.1` 送达（`remoteAddress` 因此不可信），
+所以只能自己按 Host 头把关。
 
 ## 故障排查
 

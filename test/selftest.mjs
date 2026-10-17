@@ -50,7 +50,7 @@ async function statusOf(ctx) {
   assert.ok(route !== undefined, "应当注册 /_auto-continue/status");
   const calls = [];
   await route.handler(
-    { method: "GET" },
+    { method: "GET", headers: { host: "127.0.0.1:19387" } },
     { writeHead: (status) => calls.push(status), end: (body) => calls.push(JSON.parse(body)) },
   );
   assert.equal(calls[0], 200, "状态路由应当回 200");
@@ -381,6 +381,7 @@ for (const reason of [
   await route.handler(
     {
       method: "POST",
+      headers: { host: "127.0.0.1:19387" },
       resume: () => {
         resumed = true;
       },
@@ -394,7 +395,7 @@ for (const reason of [
   // 客户端在应答前断连：writeHead 抛错也不该冒泡（async handler 里的裸抛 = 未捕获 rejection）。
   // 这里只要不抛出去，本用例就算过。
   await route.handler(
-    { method: "GET" },
+    { method: "GET", headers: { host: "127.0.0.1:19387" } },
     {
       writeHead: () => {
         throw new Error("client gone");
@@ -439,6 +440,79 @@ for (const reason of [
   assert.match(String(after.lastSkip?.reason), /^followup-failed:/);
   end(2);
   assert.equal(sink.length, 1, "额度没被烧掉，下一次异常仍然能续");
+}
+
+// 22) cause 认不出来（abort 的 cause 缺失/形态不认识）只续 1 次；completed 后机会归还
+{
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith({ maxRetries: 3 }));
+  const end = (turn, reason) => ctx._emit("session/event", { header: { id: "sU" } }, turnEndEvent(turn, reason));
+  const noCause = { kind: "aborted", reason: null }; // causeKind → "unknown"
+  end(1, noCause);
+  assert.equal(sink.length, 1, "认不出的 cause 先续 1 次（不静默漏掉真异常）");
+  end(2, noCause);
+  assert.equal(sink.length, 1, "第二次不该再续");
+  const body = await statusOf(ctx);
+  assert.equal(body.lastSkip.reason, "unknown-cause-already-continued");
+  end(3, { kind: "completed" }); // 会话缓过来了 → 机会归还
+  end(4, noCause);
+  assert.equal(sink.length, 2, "completed 之后机会应归还");
+
+  // 已知 cause 不受这条限制：仍走 maxRetries（第 2 次起走退避，用假定时器 flush）
+  const timers = captureTimers();
+  try {
+    end(5, { kind: "error" }); // count=2 → 排退避
+    timers.flushAll();
+    end(6, { kind: "error" }); // count=3 → 再排一次（上一次已 flush，pending 已清）
+    timers.flushAll();
+  } finally {
+    timers.restore();
+  }
+  assert.equal(sink.length, 4, "已知 cause 仍按 maxRetries 续");
+
+  // 宿主以后新增的**有名字**的 cause 不在这条路上：它不在 causes 名单里 → 一次都不续（fail-closed）
+  end(7, { kind: "aborted", reason: { kind: "host-shutdown" } });
+  assert.equal(sink.length, 4, "没登记过的具名 cause 不续（要续就把它加进 causes）");
+}
+
+// 23) 显式空数组 = 全禁（不再静默回落默认）；键不写才用默认名单
+{
+  assert.deepEqual(rulesOf({ rules: { kinds: [] } }).kinds, [], "显式 [] 就是全禁");
+  assert.deepEqual(rulesOf({ rules: { causes: [] } }).causes, []);
+  assert.deepEqual(rulesOf({ rules: {} }).kinds, ["error", "interrupted", "max-tokens"], "不写这个键才用默认");
+  assert.deepEqual(rulesOf({ rules: { kinds: "error" } }).kinds, ["error", "interrupted", "max-tokens"], "类型写错回落默认");
+
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith({ kinds: [], causes: [] }));
+  ctx._emit("session/event", { header: { id: "sN" } }, turnEndEvent(1, { kind: "error" }));
+  ctx._emit("session/event", { header: { id: "sN" } }, turnEndEvent(2, { kind: "aborted", reason: { kind: "parent" } }));
+  assert.equal(sink.length, 0, "全禁时任何异常都不该续");
+}
+
+// 24) 状态路由只服务回环：隧道 / DNS rebinding 送来的 Host 一律 403（且 drain body）
+{
+  const ctx = makeCtx(() => makeAgent([]));
+  apply(ctx, configWith());
+  const route = ctx._routes.find((r) => r.path === "/_auto-continue/status");
+  const call = async (host) => {
+    const calls = [];
+    let drained = false;
+    await route.handler(
+      { method: "GET", headers: host === undefined ? {} : { host }, resume: () => (drained = true) },
+      { writeHead: (status) => calls.push(status), end: (json) => calls.push(JSON.parse(json)) },
+    );
+    return { status: calls[0], drained };
+  };
+  for (const host of ["abc123.dsh-market.com", "evil.example.com", "127.0.0.1.evil.com", undefined]) {
+    const res = await call(host);
+    assert.equal(res.status, 403, `Host=${String(host)} 应当 403`);
+    assert.ok(res.drained, "403 也要把 request body 读掉");
+  }
+  assert.equal((await call("127.0.0.1:19387")).status, 200);
+  assert.equal((await call("localhost")).status, 200);
+  assert.equal((await call("[::1]:19387")).status, 200);
 }
 
 console.log("auto-continue selftest: all assertions passed");

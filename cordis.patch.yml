@@ -15,9 +15,22 @@
 #   rules:
 #     enabled: true
 #     causes: [parent, disposed, legacy, unknown]
+#     kinds: [error, interrupted, max-tokens]
 #     prompt: "继续"
 #     maxRetries: 3
-# prompt 是补发的那句话；maxRetries 是同一会话最多自动续几次，防 runaway。
+# prompt 是补发的那句话（去首尾空白、超长截断到 2000 字符）；
+# maxRetries 是同一会话最多自动续几次，防 runaway。
+#
+# kinds 管的是「不是 aborted、但也没正常收尾」的轮次（turn/end 的 reason.kind）：
+#   error        这一轮报错了（最常见：上游 429 / 超时 / 模型返回不合法）
+#   interrupted  这一轮被中断
+#   max-tokens   撞上输出长度上限
+# 想把某类排除就把它从 kinds 里删掉（三个全删会回落成默认三个，不是「全禁」；
+# 要全禁请用 enabled: false）。
+#
+# 续跑节奏：同一会话第 1 次立即续；第 2 次起先退避再续（2s 起步、×2 递增、
+# ±30% 抖动、上限 30s），避免上游 429 时几秒内原地撞满 maxRetries（每撞一次
+# 都是一轮无效的 LLM 调用）。退避期间同一会话不会重复排队；插件卸载时定时器会被清掉。
 #
 # 用 `- insert:` 包裹：bundle patch 里顶层 `- id:` 只会被 loader 当成
 # 「改已有条目配置」，条目不存在时是空操作（plugin_manager list_bundles 会把
@@ -36,3 +49,7 @@
             - disposed
             - legacy
             - unknown
+          kinds:
+            - error
+            - interrupted
+            - max-tokens

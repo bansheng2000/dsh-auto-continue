@@ -60,20 +60,36 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 | `rules.enabled` | `true` | 装上即生效；关掉后只留状态查询 |
 | `rules.causes` | `["parent","disposed","legacy","unknown"]` | 哪些 abort cause 算异常 |
 | `rules.kinds` | `["error","interrupted","max-tokens"]` | 哪些非 aborted 的 turn/end reason 算异常 |
-| `rules.prompt` | `"继续"` | 补发的那句话 |
+| `rules.prompt` | `"继续"` | 补发的那句话（去首尾空白；超长截断到 2000 字符） |
 | `rules.maxRetries` | `3` | 同一会话最多自动续几次，防 runaway |
 
 `user` 恒不算异常——这是需求的第一条，不提供开关。
+第 1 次异常立即续；第 2 次起先退避再续（2s 起、×2 递增、±30% 抖动、上限 30s），
+免得上游 429 时几秒内原地撞满 `maxRetries`（每撞一次都是一轮无效的 LLM 调用）。
 
 ## 状态查询
 
 `GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, attempts }`。
 `seen`/`lastSeen` 是观测口：宿主每发一个 `turn/end` 就计数、记下 `sessionId/turn/reason`，
 用来证明监听确实挂上了（而不是判定把事件放过了）。
-`lastSkip` 记「本该续但没续」的原因（`no-live-agent` / `agent-has-no-followup` / `followup-failed: …`）——
+`lastSkip` 记「本该续但没续」的原因（`no-live-agent` / `agent-has-no-followup` /
+`no-live-agent-on-retry` / `already-scheduled` / `followup-failed: …`）——
 没有这个字段时，「中断没续」只能靠猜。
 路由按宿主 `WebRoute` 契约注册：`{ kind: "exact", path, handler(req, res) }`，
 raw node http，`res.writeHead()/res.end()`。
+
+## 故障排查
+
+「中断了没自动继续」按这个顺序查，每一步都能自己验证：
+
+1. **插件挂没挂**：`curl http://127.0.0.1:19387/_auto-continue/status`。没响应就是没挂上
+   （查安装那节的 `- insert:` 坑与「必须重启宿主」）——此时事件监听根本没建立，判定逻辑无从谈起。
+2. **事件进来没有**：`seen` 每来一个 `turn/end` 就 +1。一直不动说明监听没挂上，或宿主改了事件名。
+3. **为什么没续**：看 `lastSkip`。`no-live-agent` = 那一刻拿不到 agent（宿主进程刚崩、或会话已 dispose，
+   插件结构上盖不住这类中断——它不会新建 agent）；`followup-failed:` 后面跟着投递时的原始错误。
+4. **是不是额度挡住了**：`attempts` 里该会话的计数到 `maxRetries` 就不再续；计数按 30 分钟窗口累计，
+   会话正常收轮（`completed`）时归零。
+5. `cause=user`（用户自己点的终止）**不会**续——这是设计，不是故障。
 
 ## 安装
 

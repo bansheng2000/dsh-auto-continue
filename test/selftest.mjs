@@ -43,6 +43,12 @@ function installTimerCapture() {
   return {
     captured,
     intervals,
+    /** 还没跑掉、也没被 clear 的定时器数（flush 用它判断「还会不会再排新的」）。 */
+    pendingCount: () => captured.filter((handle) => !cancelled.has(handle)).length,
+    /** 丢掉已被 clear 的句柄：它们跑不了，但会占着 captured 让「还剩几个」数不准。 */
+    prune: () => {
+      for (let i = captured.length - 1; i >= 0; i -= 1) if (cancelled.has(captured[i])) captured.splice(i, 1);
+    },
     flushAll: () => {
       for (;;) {
         const index = captured.findIndex((h) => !cancelled.has(h));
@@ -65,11 +71,26 @@ function installTimerCapture() {
 }
 
 const timers = installTimerCapture();
-const flush = () => timers.flushAll();
+/** 排空微任务队列：投递失败后的重试要经过 await（sleepTracked）才排下一个定时器。 */
+const drain = async () => {
+  for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+/**
+ * 推进所有已排的定时器，直到彻底安静（含 await 之后才排出来的新定时器）。
+ * 异步：v0.1.6 起投递是异步的（等 idle + 退避 sleep），一次同步 flushAll 追不上。
+ * 注意它会连「等 idle 的上界 60s」这类定时器一起跑掉——要看中间态就自己跑 timers.captured 里的单个句柄。
+ */
+const flush = async () => {
+  for (let i = 0; i < 64; i += 1) {
+    timers.flushAll();
+    await drain();
+    if (timers.pendingCount() === 0) return;
+  }
+};
 /** 推进一拍看门狗节拍，再排空它排出来的投递。 */
-const tick = () => {
+const tick = async () => {
   timers.tickIntervals();
-  timers.flushAll();
+  await flush();
 };
 
 /** 造一个最小 ctx：只有 on / inject / agents / logger（inject 只实现 webServer 路由那一种）。 */
@@ -101,10 +122,11 @@ function makeCtx(agentsGet) {
     agents: declared ? registry : undefined,
     get: (name) => (name === "agents" && declared ? registry : undefined),
     _noDrain: false,
-    _emit: (event, ...args) => {
+    // 异步：v0.1.6 起投递要等 agent 空闲 / 走退避 sleep，调用方 await 才看得到结果。
+    _emit: async (event, ...args) => {
       for (const fn of listeners.get(event) ?? []) fn(...args);
       // 观察者同步返回 = 宿主那一次 append 已经发布完 → 定时器里的投递才跑得动。
-      if (!ctx._noDrain) flush();
+      if (!ctx._noDrain) await flush();
     },
     _routes: routes,
   };
@@ -177,7 +199,7 @@ function configWith(overrides = {}) {
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, { kind: "aborted", reason: { kind: "user" } }));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, { kind: "aborted", reason: { kind: "user" } }));
   assert.equal(sink.length, 0, "user 取消不该补消息");
 }
 
@@ -186,7 +208,7 @@ function configWith(overrides = {}) {
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, { kind: "aborted", reason: { kind: "hook", reason: "budget" } }));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, { kind: "aborted", reason: { kind: "hook", reason: "budget" } }));
   assert.equal(sink.length, 0, "hook 取消默认不补");
 }
 
@@ -195,7 +217,7 @@ function configWith(overrides = {}) {
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, { kind: "aborted", reason: { kind: "parent" } }));
   assert.equal(sink.length, 1, "parent 取消应补一条");
   const message = sink[0];
   assert.equal(message.role, "user");
@@ -216,7 +238,7 @@ for (const reason of [{ kind: "completed" }, { kind: "blocked" }, { kind: "forke
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, reason));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, reason));
   assert.equal(sink.length, 0, `${reason.kind} 不该补消息`);
 }
 for (const reason of [
@@ -227,7 +249,7 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, reason));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(3, reason));
   assert.equal(sink.length, 1, `${reason.kind} 应补一条「继续」`);
   assert.equal(sink[0].content[0].text, "继续");
 }
@@ -237,9 +259,9 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith({ kinds: ["error"] }));
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(1, { kind: "interrupted" }));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(1, { kind: "interrupted" }));
   assert.equal(sink.length, 0, "自定义 kinds 之外的 kind 不补");
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(2, { kind: "error", error: { message: "502" } }));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(2, { kind: "error", error: { message: "502" } }));
   assert.equal(sink.length, 1, "kinds 里的 error 应补");
 }
 
@@ -248,8 +270,8 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
-  ctx._emit("session/event", { header: { id: "s1" } }, { type: "step/end", data: { turn: 1, step: 1 } });
-  ctx._emit("session/event", { header: { id: "s1" } }, { type: "user/message", data: {} });
+  await ctx._emit("session/event", { header: { id: "s1" } }, { type: "step/end", data: { turn: 1, step: 1 } });
+  await ctx._emit("session/event", { header: { id: "s1" } }, { type: "user/message", data: {} });
   assert.equal(sink.length, 0);
 }
 
@@ -259,25 +281,25 @@ for (const reason of [
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith({ maxRetries: 2, prompt: "接着做" }));
   ctx._noDrain = true; // 这一段要逐拍看定时器，不让 _emit 自动排空
-  const end = (i) =>
-    ctx._emit("session/event", { header: { id: "sX" } }, turnEndEvent(i, { kind: "aborted", reason: { kind: "disposed" } }));
-  end(1);
+  const end = async (i) =>
+    await ctx._emit("session/event", { header: { id: "sX" } }, turnEndEvent(i, { kind: "aborted", reason: { kind: "disposed" } }));
+  await end(1);
   assert.equal(sink.length, 0, "第 1 次也必须排进定时器：turn/end 还在 append 派发栈里");
   assert.equal(timers.captured.length, 1, "第 1 次应排一个投递");
   assert.equal(timers.captured[0].ms, 0, "第 1 次是 0ms（延后一拍，但不退避）");
-  flush();
+  await flush();
   assert.equal(sink.length, 1, "flush 之后补一条");
-  end(2);
+  await end(2);
   assert.equal(timers.captured.length, 1, "第 2 次应当排退避，而不是立刻再撞一轮");
   assert.ok(
     timers.captured[0].ms >= 700 && timers.captured[0].ms <= 1300,
     "disposed 的退避起点应为 1000ms ±30%，实际 " + String(timers.captured[0]?.ms),
   );
-  end(3);
+  await end(3);
   assert.equal(timers.captured.length, 1, "同一会话已有排队重试，不该重复排队");
-  flush();
+  await flush();
   assert.equal(sink.length, 2, "最多补 maxRetries 次");
-  end(4);
+  await end(4);
   assert.equal(sink.length, 2, "额度用尽后不再补");
   assert.equal(timers.captured.length, 0, "额度用尽也不该排重试");
   ctx._noDrain = false;
@@ -289,12 +311,12 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => undefined);
   apply(ctx, configWith({ maxRetries: 1 }));
-  ctx._emit("session/event", { header: { id: "gone" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", { header: { id: "gone" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
   assert.equal(sink.length, 0);
   // 之后 agent 回来了，应当还能用掉那一次配额
   const ctx2 = makeCtx(() => makeAgent(sink));
   apply(ctx2, configWith({ maxRetries: 1 }));
-  ctx2._emit("session/event", { header: { id: "gone" } }, turnEndEvent(2, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx2._emit("session/event", { header: { id: "gone" } }, turnEndEvent(2, { kind: "aborted", reason: { kind: "parent" } }));
   assert.equal(sink.length, 1);
 }
 
@@ -303,7 +325,7 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith({ enabled: false }));
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "disposed" } }));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "disposed" } }));
   assert.equal(sink.length, 0);
 }
 
@@ -312,10 +334,10 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith({ causes: ["hook"] }));
-  ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "hook", reason: "budget" } }));
+  await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "hook", reason: "budget" } }));
   assert.equal(sink.length, 1);
   // 同时 parent 不再补
-  ctx._emit("session/event", { header: { id: "s2" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", { header: { id: "s2" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
   assert.equal(sink.length, 1, "自定义 causes 之外的 kind 不再补");
 }
 
@@ -325,7 +347,7 @@ for (const reason of [
     const sink = [];
     const ctx = makeCtx(() => makeAgent(sink));
     apply(ctx, configWith({ causes: ["unknown"] }));
-    ctx._emit("session/event", { header: { id: "sZ" } }, turnEndEvent(1, reason));
+    await ctx._emit("session/event", { header: { id: "sZ" } }, turnEndEvent(1, reason));
     // 只有 kind==='aborted' 且能取出 cause 的才会补；这里只验证不抛异常
   }
 }
@@ -336,8 +358,8 @@ for (const reason of [
   const sinkB = [];
   const ctx = makeCtx((id) => (id === "A" ? makeAgent(sinkA) : makeAgent(sinkB)));
   apply(ctx, configWith({ maxRetries: 1 }));
-  ctx._emit("session/event", { header: { id: "A" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
-  ctx._emit("session/event", { header: { id: "B" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "disposed" } }));
+  await ctx._emit("session/event", { header: { id: "A" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", { header: { id: "B" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "disposed" } }));
   assert.equal(sinkA.length, 1);
   assert.equal(sinkB.length, 1);
 }
@@ -353,11 +375,11 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
-  ctx._emit("session/event", {}, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
-  ctx._emit("session/event", { header: {} }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
-  ctx._emit("session/event", { header: { id: "" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", {}, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", { header: {} }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", { header: { id: "" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
   assert.equal(sink.length, 0, "session 形状异常不该补消息也不该抛错");
-  ctx._emit("session/event", { header: { id: "s-ok" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", { header: { id: "s-ok" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
   assert.equal(sink.length, 1, "守门不该误伤正常事件");
 }
 
@@ -371,7 +393,7 @@ for (const reason of [
   console.warn = (...args) => warned.push(args.join(" "));
   try {
     apply(ctx, configWith({ maxRetries: 0 }));
-    ctx._emit("session/event", { header: { id: "sL" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
+    await ctx._emit("session/event", { header: { id: "sL" } }, turnEndEvent(1, { kind: "aborted", reason: { kind: "parent" } }));
   } finally {
     console.warn = realWarn;
   }
@@ -388,12 +410,12 @@ for (const reason of [
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith({ maxRetries: 1 }));
   const bad = turnEndEvent(1, { kind: "error" });
-  const end = (turn, reason) => ctx._emit("session/event", { header: { id: "sA" } }, turnEndEvent(turn, reason));
-  end(1, { kind: "error" });
-  end(2, { kind: "error" });
+  const end = async (turn, reason) => await ctx._emit("session/event", { header: { id: "sA" } }, turnEndEvent(turn, reason));
+  await end(1, { kind: "error" });
+  await end(2, { kind: "error" });
   assert.equal(sink.length, 1, "额度用尽后不该再续");
-  end(3, { kind: "completed" });
-  end(4, { kind: "error" });
+  await end(3, { kind: "completed" });
+  await end(4, { kind: "error" });
   assert.equal(sink.length, 2, "completed 之后额度应恢复");
 }
 
@@ -404,10 +426,10 @@ for (const reason of [
   apply(ctx, configWith({ maxRetries: 1 }));
   const realNow = Date.now;
   try {
-    ctx._emit("session/event", { header: { id: "sB" } }, turnEndEvent(1, { kind: "error" }));
+    await ctx._emit("session/event", { header: { id: "sB" } }, turnEndEvent(1, { kind: "error" }));
     assert.equal(sink.length, 1);
     Date.now = () => realNow() + 31 * 60_000; // 越过 30 分钟窗
-    ctx._emit("session/event", { header: { id: "sB" } }, turnEndEvent(2, { kind: "error" }));
+    await ctx._emit("session/event", { header: { id: "sB" } }, turnEndEvent(2, { kind: "error" }));
   } finally {
     Date.now = realNow;
   }
@@ -419,7 +441,7 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith({ maxRetries: 1 }));
-  ctx._emit("session/event", { header: { id: "sR" } }, turnEndEvent(1, { kind: "error" }));
+  await ctx._emit("session/event", { header: { id: "sR" } }, turnEndEvent(1, { kind: "error" }));
 
   const body = await statusOf(ctx);
   assert.equal(body.active, true);
@@ -462,7 +484,7 @@ for (const reason of [
 {
   const ctx = makeCtx(() => undefined);
   apply(ctx, configWith());
-  ctx._emit("session/event", { header: { id: "sGone" } }, turnEndEvent(2, { kind: "interrupted" }));
+  await ctx._emit("session/event", { header: { id: "sGone" } }, turnEndEvent(2, { kind: "interrupted" }));
   const body = await statusOf(ctx);
   assert.equal(body.continued, 0);
   assert.equal(body.lastSkip.reason, "no-live-agent");
@@ -483,7 +505,7 @@ for (const reason of [
   };
   const ctx = makeCtx(() => agent);
   apply(ctx, configWith({ maxRetries: 1 }));
-  ctx._emit("session/event", { header: { id: "sT" } }, turnEndEvent(1, { kind: "error" }));
+  await ctx._emit("session/event", { header: { id: "sT" } }, turnEndEvent(1, { kind: "error" }));
   assert.equal(tries, 2, "第一次投递失败后应当自动重试");
   assert.equal(sink.length, 1, "重试应当把「继续」投出去");
   const after = await statusOf(ctx);
@@ -502,7 +524,7 @@ for (const reason of [
     },
   }));
   apply(ctx, configWith({ maxRetries: 2 }));
-  ctx._emit("session/event", { header: { id: "sF" } }, turnEndEvent(1, { kind: "error" }));
+  await ctx._emit("session/event", { header: { id: "sF" } }, turnEndEvent(1, { kind: "error" }));
   assert.equal(tries, 3, "1 次首发 + 2 次重试（上界与 maxRetries 同源）");
   const body = await statusOf(ctx);
   assert.equal(body.continued, 0);
@@ -515,26 +537,26 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith({ maxRetries: 3 }));
-  const end = (turn, reason) => ctx._emit("session/event", { header: { id: "sU" } }, turnEndEvent(turn, reason));
+  const end = async (turn, reason) => await ctx._emit("session/event", { header: { id: "sU" } }, turnEndEvent(turn, reason));
   const noCause = { kind: "aborted", reason: null }; // causeKind → "unknown"
-  end(1, noCause);
+  await end(1, noCause);
   assert.equal(sink.length, 1, "认不出的 cause 先续 1 次（不静默漏掉真异常）");
-  end(2, noCause);
+  await end(2, noCause);
   assert.equal(sink.length, 1, "第二次不该再续");
   const body = await statusOf(ctx);
   assert.equal(body.lastSkip.reason, "unknown-cause-already-continued");
-  end(3, { kind: "completed" }); // 会话缓过来了 → 机会归还
-  end(4, noCause);
+  await end(3, { kind: "completed" }); // 会话缓过来了 → 机会归还
+  await end(4, noCause);
   assert.equal(sink.length, 2, "completed 之后机会应归还");
 
   // 已知 cause 不受这条限制：仍走 maxRetries（第 2 次起走退避，_emit 会自动排空定时器）
-  end(5, { kind: "error" }); // count=2 → 排退避
-  end(6, { kind: "error" }); // count=3 → 再排一次（上一次已排空，pending 已清）
+  await end(5, { kind: "error" }); // count=2 → 排退避
+  await end(6, { kind: "error" }); // count=3 → 再排一次（上一次已排空，pending 已清）
   assert.equal(sink.length, 4, "已知 cause 仍按 maxRetries 续");
   assert.equal(sink.length, 4, "已知 cause 仍按 maxRetries 续");
 
   // 宿主以后新增的**有名字**的 cause 不在这条路上：它不在 causes 名单里 → 一次都不续（fail-closed）
-  end(7, { kind: "aborted", reason: { kind: "host-shutdown" } });
+  await end(7, { kind: "aborted", reason: { kind: "host-shutdown" } });
   assert.equal(sink.length, 4, "没登记过的具名 cause 不续（要续就把它加进 causes）");
 }
 
@@ -548,8 +570,8 @@ for (const reason of [
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith({ kinds: [], causes: [] }));
-  ctx._emit("session/event", { header: { id: "sN" } }, turnEndEvent(1, { kind: "error" }));
-  ctx._emit("session/event", { header: { id: "sN" } }, turnEndEvent(2, { kind: "aborted", reason: { kind: "parent" } }));
+  await ctx._emit("session/event", { header: { id: "sN" } }, turnEndEvent(1, { kind: "error" }));
+  await ctx._emit("session/event", { header: { id: "sN" } }, turnEndEvent(2, { kind: "aborted", reason: { kind: "parent" } }));
   assert.equal(sink.length, 0, "全禁时任何异常都不该续");
 }
 
@@ -596,14 +618,14 @@ for (const reason of [
   ctx._noDrain = true;
   inDispatch = true;
   try {
-    ctx._emit("session/event", { header: { id: "sBoom" } }, turnEndEvent(1, { kind: "error" }));
+    await ctx._emit("session/event", { header: { id: "sBoom" } }, turnEndEvent(1, { kind: "error" }));
     assert.equal(sink.length, 0, "派发栈里绝不能投（会被宿主的 append 重入保护打回）");
     assert.equal(timers.captured.length, 1, "应当已排一次延后投递");
   } finally {
     inDispatch = false;
   }
   ctx._noDrain = false;
-  flush();
+  await flush();
   assert.equal(sink.length, 1, "派发结束之后应当投出去");
   const body = await statusOf(ctx);
   assert.equal(body.continued, 1);
@@ -616,11 +638,11 @@ for (const reason of [
   const ctx = makeCtx(() => makeAgent(sink));
   apply(ctx, configWith());
   ctx._noDrain = true;
-  ctx._emit("session/event", { header: { id: "sD" } }, turnEndEvent(1, { kind: "error" }));
+  await ctx._emit("session/event", { header: { id: "sD" } }, turnEndEvent(1, { kind: "error" }));
   assert.equal(timers.captured.length, 1, "应当已排一次投递");
-  ctx._emit("dispose");
+  await ctx._emit("dispose");
   ctx._noDrain = false;
-  flush();
+  await flush();
   assert.equal(sink.length, 0, "dispose 之后不该再投");
 }
 
@@ -633,9 +655,9 @@ for (const reason of [
   let now = 1_000_000;
   Date.now = () => now;
   try {
-    ctx._emit("session/event", { header: { id: "sW" } }, { type: "turn/start", data: { turn: 1 } });
+    await ctx._emit("session/event", { header: { id: "sW" } }, { type: "turn/start", data: { turn: 1 } });
     now += 10 * 60_000;
-    tick();
+    await tick();
     assert.equal(timers.intervals.length, 0, "默认关：连节拍都不该建");
     assert.equal(sink.length, 0, "默认关：轮次悬着也不补");
   } finally {
@@ -652,22 +674,22 @@ for (const reason of [
   let now = 1_000_000;
   Date.now = () => now;
   try {
-    const start = () =>
-      ctx._emit("session/event", { header: { id: "sW" } }, { type: "turn/start", data: { turn: 1 } });
-    start();
+    const start = async () =>
+      await ctx._emit("session/event", { header: { id: "sW" } }, { type: "turn/start", data: { turn: 1 } });
+    await start();
     assert.equal(timers.intervals.length, 1, "打开后才建节拍");
-    tick();
+    await tick();
     assert.equal(sink.length, 0, "还没到超时线，不补");
     // 轮次里的任何事件都算「还活着」
     now += 30_000;
-    ctx._emit("session/event", { header: { id: "sW" } }, { type: "step/start", data: { step: 2 } });
+    await ctx._emit("session/event", { header: { id: "sW" } }, { type: "step/start", data: { step: 2 } });
     now += 30_000;
-    tick();
+    await tick();
     assert.equal(sink.length, 0, "有心跳就不算静默");
     now += 61_000;
-    tick();
+    await tick();
     assert.equal(sink.length, 1, "静默超时应当补一条");
-    tick();
+    await tick();
     assert.equal(sink.length, 1, "同一轮只补一次（心跳已摘除）");
     const body = await statusOf(ctx);
     assert.deepEqual(body.attempts, { sW: 1 }, "看门狗补发也走同一份额度");
@@ -675,9 +697,9 @@ for (const reason of [
     assert.equal(body.watchdog.watching, 0);
     assert.equal(body.watchdog.minutes, 1);
     // 新轮次重新武装，但额度已用尽 → 不再补
-    start();
+    await start();
     now += 61_000;
-    tick();
+    await tick();
     assert.equal(sink.length, 1, "额度用尽后看门狗不再补");
     assert.equal((await statusOf(ctx)).lastSkip.reason, "watchdog-out-of-quota");
   } finally {
@@ -706,6 +728,153 @@ for (const reason of [
   const code = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
   assert.equal(/kind:\s*["']plugin["']\s*,/.test(code), false, "lib/ 里不得再写 { kind: \"plugin\", … }");
   assert.ok(/plugin:dsh-auto-continue/.test(code), "lib/ 里必须写明 plugin:<包名>");
+}
+
+// 1c) 设置页那两个顶层 volatile 字段：优先级、夹紧、缺省（顶层的设置页值盖过 rules 里的同名键）
+{
+  assert.equal(rulesOf({}).retryIntervalMs, 2000, "重试间隔缺省 2000ms");
+  assert.equal(rulesOf({ retryIntervalMs: 5000 }).retryIntervalMs, 5000);
+  assert.equal(rulesOf({ retryIntervalMs: 0 }).retryIntervalMs, 0, "0 = 立刻重试");
+  assert.equal(rulesOf({ retryIntervalMs: 1e9 }).retryIntervalMs, 600000, "上限 10 分钟");
+  assert.equal(rulesOf({ retryIntervalMs: -5 }).retryIntervalMs, 0, "负数夹到 0");
+  assert.equal(rulesOf({ retryIntervalMs: "abc" }).retryIntervalMs, 2000, "非数值回落缺省");
+  assert.equal(rulesOf({ rules: { maxRetries: 3 } }).maxRetries, 3, "老位置仍然生效");
+  assert.equal(rulesOf({ rules: { maxRetries: 3 }, maxRetries: 5 }).maxRetries, 5, "设置页的值优先");
+  assert.equal(rulesOf({ maxRetries: 999 }).maxRetries, 50, "上限 50");
+  assert.equal(rulesOf(resolveConfig({ maxRetries: { get: () => 7 } })).maxRetries, 7, "volatile 包装由 resolveConfig 解包");
+}
+
+// 30) ★ 回归：投递前必须等 agent 空下来
+//     宿主 wakeDriver() 在 phase 仍 running 且未被 abort 时**丢弃唤醒**，消息只排进 next-turn；
+//     这一轮若从 blocked / 「本轮没有消息」两条提前 return 路径收尾，消息就永久滞留、
+//     没人消费 —— agent 已 idle、会话却停在原地（用户看到的「卡住」）。
+//     所以投递要等一拍空档：从 idle 投递，宿主才会新建 driver 去消费它。
+{
+  const sink = [];
+  let status = "running";
+  let release;
+  const agent = {
+    get status() {
+      return status;
+    },
+    whenIdle: () => new Promise((resolve) => (release = resolve)),
+    followup: (message) => sink.push(message),
+  };
+  const ctx = makeCtx(() => agent);
+  apply(ctx, configWith({ maxRetries: 1 }));
+  // 清掉前面用例可能留下的定时器（用例之间共享假定时器栈），否则下面数不清自己排了几个。
+  await flush();
+  timers.prune();
+  assert.equal(timers.captured.length, 0, "用例开始前应无残留定时器");
+  ctx._noDrain = true;
+  await ctx._emit("session/event", { header: { id: "sIdle" } }, turnEndEvent(1, { kind: "error" }));
+  assert.equal(timers.captured.length, 1, "应当已排一次投递");
+  ctx._noDrain = false;
+  // 手动只跑这一拍（不能用 flush：它会连「等 idle 上界 60s」的定时器一起跑掉）
+  timers.captured.splice(0, 1)[0].fn();
+  await drain();
+  assert.equal(sink.length, 0, "agent 还在跑：先别投（投了也会被宿主丢弃唤醒）");
+  status = "idle";
+  release();
+  await drain();
+  assert.equal(sink.length, 1, "agent 空下来之后才投");
+  assert.equal((await statusOf(ctx)).continued, 1);
+}
+
+// 31) 等不到 idle 也照投（上界 IDLE_WAIT_MS）：宁可晚一点，也不要丢掉这一轮
+{
+  const sink = [];
+  const agent = {
+    status: "running",
+    whenIdle: () => new Promise(() => {}),
+    followup: (message) => sink.push(message),
+  };
+  const ctx = makeCtx(() => agent);
+  apply(ctx, configWith({ maxRetries: 1 }));
+  // 清掉前面用例可能留下的定时器（用例之间共享假定时器栈），否则下面数不清自己排了几个。
+  await flush();
+  timers.prune();
+  assert.equal(timers.captured.length, 0, "用例开始前应无残留定时器");
+  ctx._noDrain = true;
+  await ctx._emit("session/event", { header: { id: "sSlow" } }, turnEndEvent(1, { kind: "error" }));
+  ctx._noDrain = false;
+  timers.captured.splice(0, 1)[0].fn();
+  await drain();
+  assert.equal(sink.length, 0, "还没到上界：继续等");
+  const idleTimer = timers.captured.find((handle) => handle.ms === 60000);
+  assert.ok(idleTimer !== undefined, "应当有一个 60s 的等待上界定时器");
+  idleTimer.fn();
+  await drain();
+  assert.equal(sink.length, 1, "上界到了就照投");
+}
+
+// 32) 重试间隔可配：退避起点 = retryIntervalMs × 类型系数（error 1×）× ±30%
+{
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, { rules: { maxRetries: 2 }, retryIntervalMs: 8000 });
+  // 清掉前面用例可能留下的定时器（用例之间共享假定时器栈），否则下面数不清自己排了几个。
+  await flush();
+  timers.prune();
+  assert.equal(timers.captured.length, 0, "用例开始前应无残留定时器");
+  ctx._noDrain = true;
+  const end = async (turn) =>
+    ctx._emit("session/event", { header: { id: "sInt" } }, turnEndEvent(turn, { kind: "error" }));
+  await end(1);
+  await flush();
+  assert.equal(sink.length, 1, "第 1 次立即投");
+  await end(2);
+  const ms = timers.captured[0]?.ms;
+  assert.ok(ms >= 5600 && ms <= 10400, "8000ms × 1 × 2^0 ±30%，实际 " + String(ms));
+}
+
+// 33) dispose 打断重试 sleep：醒来后不得再投一条
+{
+  let tries = 0;
+  const ctx = makeCtx(() => ({
+    followup: () => {
+      tries += 1;
+      throw new Error("boom");
+    },
+  }));
+  apply(ctx, { rules: { maxRetries: 3 }, retryIntervalMs: 4000 });
+  // 清掉前面用例可能留下的定时器（用例之间共享假定时器栈），否则下面数不清自己排了几个。
+  await flush();
+  timers.prune();
+  assert.equal(timers.captured.length, 0, "用例开始前应无残留定时器");
+  ctx._noDrain = true;
+  await ctx._emit("session/event", { header: { id: "sDrain" } }, turnEndEvent(1, { kind: "error" }));
+  ctx._noDrain = false;
+  timers.captured.splice(0, 1)[0].fn();
+  await drain();
+  assert.equal(tries, 1, "第 1 次投递失败了");
+  assert.equal(timers.pendingCount(), 1, "应当已排下一次重试");
+  await ctx._emit("dispose");
+  await flush();
+  assert.equal(tries, 1, "dispose 之后不该再重试");
+}
+
+// 34) 状态路由报出生效的重试参数与来源（setting / rules / default）
+{
+  const ctx = makeCtx(() => makeAgent([]));
+  apply(ctx, { rules: { maxRetries: 3 }, retryIntervalMs: 9000 });
+  const body = await statusOf(ctx);
+  assert.equal(body.retry.maxRetries, 3);
+  assert.equal(body.retry.retryIntervalMs, 9000);
+  assert.deepEqual(body.retry.sources, { maxRetries: "rules", retryIntervalMs: "setting" });
+
+  const ctx2 = makeCtx(() => makeAgent([]));
+  apply(ctx2, { rules: { maxRetries: 4 }, maxRetries: 6 });
+  const body2 = await statusOf(ctx2);
+  assert.equal(body2.retry.maxRetries, 6, "设置页的值优先");
+  assert.equal(body2.retry.sources.maxRetries, "setting");
+
+  const ctx3 = makeCtx(() => makeAgent([]));
+  apply(ctx3, {});
+  const body3 = await statusOf(ctx3);
+  assert.deepEqual(body3.retry.sources, { maxRetries: "default", retryIntervalMs: "default" });
+  assert.equal(body3.retry.maxRetries, 3, "缺省仍是 3 次");
+  assert.equal(body3.retry.retryIntervalMs, 2000, "缺省仍是 2000ms");
 }
 
 console.log("auto-continue selftest: all assertions passed");

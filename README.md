@@ -53,6 +53,14 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 投递抛错不烧续跑额度，但会按同一退避阶梯**有界重试**（上界 = `maxRetries`，免得持续失败变成热循环），
 重试时重新取一次 agent（这几百毫秒里会话可能已被 dispose）。
 
+**★ 投递前要等 agent 空闲**：「回复太快 / 上一轮还没收干净就续」会踩另一个坑。`followup` 只保证消息进 inbox：
+若那一刻 `agent.status` 还是 `running`，宿主 `wakeDriver` 在「非 idle 且未被 abort」时会**丢弃唤醒**
+（`dsh-agent-loop/lib/index.js:854-869`），而这一轮如果走的是 `turn()` 的两条提前返回分支（`:960-962` 被 blocked、
+`:965-968` 空轮，两条都跳过 `:1037` 的 `if (!this.inbox.hasPending) return false`），kick 收尾时 `wakeRequested` 仍是 false ——
+那条「继续」就永远滞留在 `next-turn` 里，agent 变 idle 却没人消费它；界面表现是运行指示器停在
+「深度求索中，用时 Xs ···」（`@deepseek-ai/dsh-client-ui-chat/lib/client.js:5599-5637` 的 RunningStatus，文案在 `:5801`）。
+所以投递前先看 `agent.status`：不是 `idle` 就 `await agent.whenIdle()` 再投；等不到就 60 秒后照投（不吞掉这次继续，也不改判定语义）。
+
 **看门狗（默认关，`rules.watchdogMinutes`）**补的是事件路径够不着的那一类：上游流在 completion 之前断掉时，
 宿主既不抛错也不落 `turn/end`，轮次悬在半空——`turn/end` 永远不来，判定逻辑再准也无从触发
 （2026-10-14 10:49 实测，UI 报 `upstream stream ended before a completion event / this turn may be incomplete`）。
@@ -107,9 +115,34 @@ cause 认不出来（`unknown`，即 abort 的 cause 字段缺失或形态不认
 第 1 次异常立即续（仍在 `setTimeout(0)` 之后投递，见上「投递必须延后一拍」）；第 2 次起先退避再续（2s 起、×2 递增、±30% 抖动、上限 30s），
 免得上游 429 时几秒内原地撞满 `maxRetries`（每撞一次都是一轮无效的 LLM 调用）。
 
+## 设置页
+
+设置 → 侧栏「自动继续」（社区页排在宿主自带页之后，`order: 460`）。两段内容：
+
+- **重试参数**：`maxRetries`（重试次数）与 `retryIntervalMs`（重试间隔，毫秒）。保存走宿主自己的 settings form model
+  （`configForms.get("auto-continue")` + `SettingsFormModel`），带 revision 校验，落盘由宿主负责，本插件不写 storage。
+- **运行状态**：每 5 秒读一次 `/_auto-continue/status`，当场看「有没有触发 / 为什么没续」。
+
+这两个值落在 loader entry `auto-continue` 的**顶层 volatile 字段**上（`lib/index.js` 的 `Config`；不是 loader config 里的 `rules.*`，
+而是宿主 settings 数据库里的用户值）。取值优先级是 `顶层 > rules > 默认`，`status.retry.sources` 会告诉你当前生效值来自哪一层；
+所以设置页改完**下一次投递就生效，不用重启宿主**（`maxRetries` 夹紧到 0–50，`retryIntervalMs` 夹紧到 0–600000，非法值回落默认）。
+loader config 里的 `rules.maxRetries` 仍然可用，只是优先级更低。
+
+浏览器半边是 `src/client/index.js`；`lib/client.js` 是 `scripts/build-client.mjs` 包出来的宿主认的经典脚本
+（`window.__ModuleLoader__.load({ id, factory })`，**不是 ESM**，除 `react` 与客户端 UI primitives 外不 require 任何东西）：
+
+```bash
+pnpm run build      # 改过 src/client/ 必须重跑；lib/client.js 是产物，和 src/ 一起提交
+```
+
+宿主侧的挂载点是 `package.json` 的 `dsh.client.platform = "web"` + `exports["./client"]`；卡片注册进宿主的 `settings.section` 槽位，
+`id` 就是 loader entry id `auto-continue`，导航标签是 thunk（跟着语言切换）。装到另一台机器后**必须重启宿主**才会加载浏览器半边
+（和插件本身一样，启动时才拉；profile 里那份拷贝必须有 `lib/client.js`）。宿主没提供 config form 时卡片退化成只读（只显示运行状态），不报错。
+
 ## 状态查询
 
-`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, attempts, watchdog }`。
+`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, attempts, retry, watchdog }`。
+`retry` = `{ maxRetries, retryIntervalMs, sources }`（`sources` 标出每个值来自 `rules` / 设置页 `setting` / `default`）。
 `watchdog` = `{ minutes, watching, fires, lastFireAt }`（`watching` = 当前武装中的轮次数，即「运行中且有心跳」的会话数）。
 `seen`/`lastSeen` 是观测口：宿主每发一个 `turn/end` 就计数、记下 `sessionId/turn/reason`，
 用来证明监听确实挂上了（而不是判定把事件放过了）。
@@ -159,10 +192,13 @@ profile 的 `package.json` 加一条依赖，再 `pnpm install`：
 - pnpm 装进 profile 的 `node_modules` 是**真实拷贝，不是软链**：改了远端或本地源码都要重装（或手工同步）才生效。
 - 改完代码要**重启宿主**，插件是启动时加载的（改文件本身不会热重载；`plugin_manager` 关掉再打开 bundle 会让 entry 重建，但 ESM 模块缓存还在，仍是旧代码）。
 - 忘写 `inject: ["agents"]` 不会报错，只会静默不续（见上「继续的投递口」）。
+- 手工同步/本地开发时别漏了浏览器半边：`lib/client.js`（产物）要和 `lib/index.js` 一起拷。漏了它的症状是
+  插件照常续、但设置里没有「自动继续」这张卡片。
 
 ### 更新
 
-1. 改代码 → 改 `package.json` 的 `version` → commit → push（顺手打 tag `vX.Y.Z`）；
+1. 改代码（动过 `src/client/` 就先 `pnpm run build`，产物 `lib/client.js` 一起提交）→ 改 `package.json` 的 `version`
+   → commit → push（顺手打 tag `vX.Y.Z`）；
 2. 另一台机器 `pnpm update dsh-auto-continue`。裸 `github:` 规格会重新解析默认分支最新提交；
    想按版本号升级，规格写成 `github:bansheng2000/dsh-auto-continue#semver:^0.1.0`，再配合 tag；
 3. 重启宿主。
@@ -186,13 +222,16 @@ profile 的 `package.json` 加一条依赖，再 `pnpm install`：
 
 真正不属于安装残留、要自己判断要不要删的：profile 目录里的 `package.json.bak-*` / `cordis.patch.yml.bak-*`
 （手工备份）、`.dsh-market/`（插件市场的缓存，会自己重建）。
+
 ## 自检
 
 依赖没提交进 git（`node_modules/` 已忽略），第一次跑先装：
 
 ```bash
 pnpm install
-node test/selftest.mjs   # 期望输出 auto-continue selftest: all assertions passed
+pnpm run build            # 只在改过 src/client/ 后需要；产物 lib/client.js 要一起提交
+node test/selftest.mjs    # 宿主半边，期望 auto-continue selftest: all assertions passed
+node test/client.test.mjs # 浏览器半边，期望 auto-continue client test: all assertions passed
 ```
 
 覆盖：默认配置、user/hook 不续、parent 续一条、`kinds` 里的 error/interrupted 续、
@@ -203,3 +242,6 @@ enabled=false、自定义 `causes`、畸形 payload、多会话隔离、
 dispose 清掉排队中的投递。
 format v4 的 source 准入（退役的 `{ kind: "plugin", … }` 被拒、`PLUGIN_SOURCE` 过准入且冻结、lib/ 静态扫描无退役写法）。
 看门狗默认关（连节拍都不建）、打开后静默超时补一次并受同一份额度约束。
+投递前等 idle（agent 还在 running 时不投，等它 idle 再投）、设置页顶层 volatile 字段的优先级/夹紧/缺省。
+浏览器半边（`test/client.test.mjs`）：经典脚本装载与工厂 id、只 require 平台种子包、注册进 `settings.section`（id/label/表单字段/保存动作、`maxRetries`+`retryIntervalMs` 两个字段）、无 config form 时的退化、
+中英词条一致性，以及 CSS 作用域（每条规则都必须挂在卡片自己的根类下，`data-plugin-css` 只用于去重、不是祖先）。

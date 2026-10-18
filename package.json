@@ -1,15 +1,18 @@
 {
   "name": "dsh-auto-continue",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "对话被非正常中断（崩溃、父级停止、归档、未知原因）时自动发一句「继续」把任务接着跑；用户自己点的终止不动。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/index.js",
+    "lib",
+    "src",
+    "scripts",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -39,6 +42,13 @@
       "dshReleases": {
         "0.1.7-rc.1": "compatible"
       }
+    },
+    "client": {
+      "platform": "web"
     }
+  },
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node test/selftest.mjs && node test/client.test.mjs"
   }
 }

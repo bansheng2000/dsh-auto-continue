@@ -150,6 +150,25 @@ profile 的 `package.json` 加一条依赖，再 `pnpm install`：
    想按版本号升级，规格写成 `github:bansheng2000/dsh-auto-continue#semver:^0.1.0`，再配合 tag；
 3. 重启宿主。
 
+## 卸载
+
+走 DSH 的插件管理（设置 → 插件，或宿主自己的 `removeBundle`）。它按这个顺序来：
+
+1. 插件已启用的话先取消勾选 —— 这一步会把 `dsh-auto-continue` 从 profile manifest 的 `dsh.profile.bundles` 里摘掉；
+2. 确认这个 bundle 声明的 loader 行没有还挂在运行中的 loader 上，否则抛 `bundle-in-use`（先重启宿主再来）；
+3. `pnpm remove dsh-auto-continue` —— 非零退出或超时就直接抛错并回传 pnpm 原始输出，不会静默半卸；
+4. 重新发布 loader 并 reload —— 合成出来的 `cordis.yml` 里 `- id: auto-continue` 那一行随之消失。
+
+因为是 `file:` 依赖，卸载**只删 profile 里那份拷贝**（`<profile>/node_modules/dsh-auto-continue`）；
+本仓库（`E:\文档\deepseek-harness\dsh-auto-continue`）原封不动。`dependencies` 里那条、`pnpm-lock.yaml`、
+`node_modules/.modules.yaml` 里的记录由 pnpm 一并清掉。插件自己不写任何 storage/配置，所以没有"卸载后还留着状态"的问题。
+
+手工卸（不推荐，跳过 1/2/4）：把 `dsh.profile.bundles` 里的名字删掉、`dependencies` 里那条 `file:` 删掉、
+删 `node_modules/dsh-auto-continue`，然后重启宿主。只做第 3 步不做第 1 步的症状是：宿主启动时 loader 里那行还在、
+模块却没了 —— 加载报错。
+
+真正不属于安装残留、要自己判断要不要删的：profile 目录里的 `package.json.bak-*` / `cordis.patch.yml.bak-*`
+（手工备份）、`.dsh-market/`（插件市场的缓存，会自己重建）。
 ## 自检
 
 依赖没提交进 git（`node_modules/` 已忽略），第一次跑先装：

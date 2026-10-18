@@ -41,6 +41,18 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 所以必须另起一轮：`agent.followup(message)` → `send(input, "next-turn", true)`，
 会往 inbox 排队并唤醒 driver。steer 只在活轮次内有效，轮次关了它无处可去。
 
+**★ 投递必须延后一拍（第 1 次也是）**：`turn/end` 是在 `Session.commit()` 的 try 块里**同步**派发的
+（`dsh-session/lib/index.js:1579-1599`：`:1581` 置 `entry.appending = true` → `:1592` 派发观察者
+→ `:1595` 才在 `finally` 复位），而 `followup` → `send` → `inbox.splice` →
+`session.append("agent/inbox/spliced")`（`dsh-agent-loop/lib/index.js:806-808` / `:803` / `:204`）
+会撞上 `publicationEntry()` 的重入保护（`dsh-session/lib/index.js:1568-1571`），抛出
+`session append cannot reenter while another append is being published`。
+在观察者里同步投递 = **一次都续不成**（症状：status 里 `seen` 一直涨、`continued` 恒为 0、
+`lastSkip` 记 `followup-failed: …`）。
+所以本插件**所有**投递都排进 `setTimeout`（第 1 次 0ms）再执行。
+投递抛错不烧续跑额度，但会按同一退避阶梯**有界重试**（上界 = `maxRetries`，免得持续失败变成热循环），
+重试时重新取一次 agent（这几百毫秒里会话可能已被 dispose）。
+
 消息自己造，形状与宿主 `createUserMessage` 一致（`deepFreeze(structuredClone({id, role:'user', content, source}))`），
 不为此引入 `@deepseek-ai/dsh-llm` 依赖。
 
@@ -68,7 +80,7 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 cause 认不出来（`unknown`，即 abort 的 cause 字段缺失或形态不认识）**只续 1 次**，第二次会记进 `lastSkip`——
 既不静默漏掉真异常，也不会把「用户手动停、但 cause 没记上」那种反复续起来。
 反过来，宿主以后新增的**有名字**的 cause 不在默认名单里 → 一次都不续（要续就把它加进 `rules.causes`）。
-第 1 次异常立即续；第 2 次起先退避再续（2s 起、×2 递增、±30% 抖动、上限 30s），
+第 1 次异常立即续（仍在 `setTimeout(0)` 之后投递，见上「投递必须延后一拍」）；第 2 次起先退避再续（2s 起、×2 递增、±30% 抖动、上限 30s），
 免得上游 429 时几秒内原地撞满 `maxRetries`（每撞一次都是一轮无效的 LLM 调用）。
 
 ## 状态查询
@@ -76,7 +88,7 @@ cause 认不出来（`unknown`，即 abort 的 cause 字段缺失或形态不认
 `GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, attempts }`。
 `seen`/`lastSeen` 是观测口：宿主每发一个 `turn/end` 就计数、记下 `sessionId/turn/reason`，
 用来证明监听确实挂上了（而不是判定把事件放过了）。
-`lastSkip` 记「本该续但没续」的原因（`no-live-agent` / `agent-has-no-followup` /
+`lastSkip` 记「本该续但没续」的原因（投递成功/重试成功后清空）（`no-live-agent` / `agent-has-no-followup` /
 `no-live-agent-on-retry` / `already-scheduled` / `unknown-cause-already-continued` /
 `followup-failed: …`）——没有这个字段时，「中断没续」只能靠猜。
 路由按宿主 `WebRoute` 契约注册：`{ kind: "exact", path, handler(req, res) }`，
@@ -90,7 +102,8 @@ cloudflared 隧道会把公网请求以 `127.0.0.1` 送达（`remoteAddress` 因
 
 「中断了没自动继续」按这个顺序查，每一步都能自己验证：
 
-1. **插件挂没挂**：`curl http://127.0.0.1:19387/_auto-continue/status`。没响应就是没挂上
+1. **插件挂没挂**：`curl http://127.0.0.1:<宿主 web 端口>/_auto-continue/status`
+   （端口以宿主**实际监听**为准——本机当前是 65483，写死 19387 只在旧宿主上成立）。没响应就是没挂上
    （查安装那节的 `- insert:` 坑与「必须重启宿主」）——此时事件监听根本没建立，判定逻辑无从谈起。
 2. **事件进来没有**：`seen` 每来一个 `turn/end` 就 +1。一直不动说明监听没挂上，或宿主改了事件名。
 3. **为什么没续**：看 `lastSkip`。`no-live-agent` = 那一刻拿不到 agent（宿主进程刚崩、或会话已 dispose，
@@ -135,4 +148,7 @@ node test/selftest.mjs   # 期望输出 auto-continue selftest: all assertions p
 
 覆盖：默认配置、user/hook 不续、parent 续一条、`kinds` 里的 error/interrupted 续、
 `completed`/`blocked` 不续、`kinds` 覆盖生效、maxRetries 封顶、拿不到 agent 不耗配额、
-enabled=false、自定义 `causes`、畸形 payload、多会话隔离。
+enabled=false、自定义 `causes`、畸形 payload、多会话隔离、
+投递失败自动重试（成功即清 `lastSkip`；持续失败时有界重试、不烧额度）、
+**投递必须逃出 append 派发栈**（回归用例：派发栈内 followup 抛重入错误时，第 1 次投递仍是延后 0ms 排队的）、
+dispose 清掉排队中的投递。

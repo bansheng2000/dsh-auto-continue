@@ -8,6 +8,45 @@ const { apply, rulesOf, resolveConfig } = mod;
 // 0) 必须在 inject 里声明 agents，否则宿主 ctx 上根本没有 ctx.agents —— 续不了。
 assert.ok(mod.inject.includes("agents"), "inject 必须声明 agents（ctx.agents 才会存在）");
 
+/**
+ * 测试统一接管 setTimeout / clearTimeout：插件现在的**每一次**投递都排在定时器里
+ * （第 1 次是 0ms——turn/end 是在宿主的 append 派发栈里派发的，同步调 followup 会撞
+ * 「session append cannot reenter while another append is being published」）。
+ * flush() 手动推进；_emit 默认自动排空（要看栈内时态就置 ctx._noDrain = true）。
+ */
+function installTimerCapture() {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const captured = [];
+  const cancelled = new Set();
+  globalThis.setTimeout = (fn, ms) => {
+    const handle = { fn, ms, unref() {} };
+    captured.push(handle);
+    return handle;
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (handle !== undefined && handle !== null) cancelled.add(handle);
+  };
+  return {
+    captured,
+    flushAll: () => {
+      for (;;) {
+        const index = captured.findIndex((h) => !cancelled.has(h));
+        if (index === -1) return;
+        const handle = captured.splice(index, 1)[0];
+        handle.fn();
+      }
+    },
+    restore: () => {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    },
+  };
+}
+
+const timers = installTimerCapture();
+const flush = () => timers.flushAll();
+
 /** 造一个最小 ctx：只有 on / inject / agents / logger（inject 只实现 webServer 路由那一种）。 */
 function makeCtx(agentsGet) {
   const listeners = new Map();
@@ -36,8 +75,11 @@ function makeCtx(agentsGet) {
     },
     agents: declared ? registry : undefined,
     get: (name) => (name === "agents" && declared ? registry : undefined),
+    _noDrain: false,
     _emit: (event, ...args) => {
       for (const fn of listeners.get(event) ?? []) fn(...args);
+      // 观察者同步返回 = 宿主那一次 append 已经发布完 → 定时器里的投递才跑得动。
+      if (!ctx._noDrain) flush();
     },
     _routes: routes,
   };
@@ -76,24 +118,8 @@ function configWith(overrides = {}) {
   return { rules: { ...overrides } };
 }
 
-/** 抓住插件排的退避定时器（不真等几秒），测试里手动 flush；用完必须 restore。 */
-function captureTimers() {
-  const real = globalThis.setTimeout;
-  const captured = [];
-  globalThis.setTimeout = (fn, ms) => {
-    captured.push({ fn, ms });
-    return { unref() {} };
-  };
-  return {
-    captured,
-    flushAll: () => {
-      while (captured.length > 0) captured.shift().fn();
-    },
-    restore: () => {
-      globalThis.setTimeout = real;
-    },
-  };
-}
+// 定时器接管见上面的 installTimerCapture（全局唯一，flush() 推进）。
+// 旧版本这里有个按用例临时 captureTimers()，现在所有投递都走定时器，改成全局接管。
 
 // 1) 配置解析：缺省 = 开，causes 覆盖四个异常 abort cause，kinds 覆盖三种非 aborted 异常，prompt=继续，maxRetries=3
 {
@@ -200,34 +226,34 @@ for (const reason of [
   assert.equal(sink.length, 0);
 }
 
-// 8) maxRetries 护栏：第 1 次立即补，第 2 次起排退避（不原地重撞），超限后不再补
+// 8) maxRetries 护栏：投递一律先排进定时器（第 1 次 0ms），第 2 次起退避，超限后不再补
 {
   const sink = [];
   const ctx = makeCtx(() => makeAgent(sink));
-  const clock = captureTimers();
-  try {
-    apply(ctx, configWith({ maxRetries: 2, prompt: "接着做" }));
-    const end = (i) =>
-      ctx._emit("session/event", { header: { id: "sX" } }, turnEndEvent(i, { kind: "aborted", reason: { kind: "disposed" } }));
-    end(1);
-    assert.equal(sink.length, 1, "第 1 次应当立即补");
-    assert.equal(clock.captured.length, 0, "第 1 次不该排退避");
-    end(2);
-    assert.equal(clock.captured.length, 1, "第 2 次应当排退避，而不是立刻再撞一轮");
-    assert.ok(
-      clock.captured[0].ms >= 700 && clock.captured[0].ms <= 1300,
-      `disposed 的退避起点应为 1000ms ±30%，实际 ${clock.captured[0]?.ms}`,
-    );
-    end(3);
-    assert.equal(clock.captured.length, 1, "同一会话已有排队重试，不该重复排队");
-    clock.flushAll();
-    assert.equal(sink.length, 2, "最多补 maxRetries 次");
-    end(4);
-    assert.equal(sink.length, 2, "额度用尽后不再补");
-    assert.equal(clock.captured.length, 0, "额度用尽也不该排重试");
-  } finally {
-    clock.restore();
-  }
+  apply(ctx, configWith({ maxRetries: 2, prompt: "接着做" }));
+  ctx._noDrain = true; // 这一段要逐拍看定时器，不让 _emit 自动排空
+  const end = (i) =>
+    ctx._emit("session/event", { header: { id: "sX" } }, turnEndEvent(i, { kind: "aborted", reason: { kind: "disposed" } }));
+  end(1);
+  assert.equal(sink.length, 0, "第 1 次也必须排进定时器：turn/end 还在 append 派发栈里");
+  assert.equal(timers.captured.length, 1, "第 1 次应排一个投递");
+  assert.equal(timers.captured[0].ms, 0, "第 1 次是 0ms（延后一拍，但不退避）");
+  flush();
+  assert.equal(sink.length, 1, "flush 之后补一条");
+  end(2);
+  assert.equal(timers.captured.length, 1, "第 2 次应当排退避，而不是立刻再撞一轮");
+  assert.ok(
+    timers.captured[0].ms >= 700 && timers.captured[0].ms <= 1300,
+    "disposed 的退避起点应为 1000ms ±30%，实际 " + String(timers.captured[0]?.ms),
+  );
+  end(3);
+  assert.equal(timers.captured.length, 1, "同一会话已有排队重试，不该重复排队");
+  flush();
+  assert.equal(sink.length, 2, "最多补 maxRetries 次");
+  end(4);
+  assert.equal(sink.length, 2, "额度用尽后不再补");
+  assert.equal(timers.captured.length, 0, "额度用尽也不该排重试");
+  ctx._noDrain = false;
   assert.deepEqual(sink.map((m) => m.content[0].text), ["接着做", "接着做"]);
 }
 
@@ -417,29 +443,44 @@ for (const reason of [
   assert.deepEqual(body.attempts, {}, "没投出去就不该记额度");
 }
 
-// 21) followup 抛错：不记账、不烧额度、记 lastSkip
+// 21) 投递抛错：自动重试（不烧额度），重试成功后 lastSkip 清空
 {
-  let fail = true;
+  let tries = 0;
   const sink = [];
   const agent = {
     followup: (message) => {
-      if (fail) {
-        fail = false;
-        throw new Error("send rejected");
-      }
+      tries += 1;
+      if (tries === 1) throw new Error("send rejected");
       sink.push(message);
     },
   };
   const ctx = makeCtx(() => agent);
   apply(ctx, configWith({ maxRetries: 1 }));
-  const end = (turn) => ctx._emit("session/event", { header: { id: "sT" } }, turnEndEvent(turn, { kind: "error" }));
-  end(1);
+  ctx._emit("session/event", { header: { id: "sT" } }, turnEndEvent(1, { kind: "error" }));
+  assert.equal(tries, 2, "第一次投递失败后应当自动重试");
+  assert.equal(sink.length, 1, "重试应当把「继续」投出去");
   const after = await statusOf(ctx);
-  assert.equal(after.continued, 0);
-  assert.deepEqual(after.attempts, {}, "抛错不该烧掉额度");
-  assert.match(String(after.lastSkip?.reason), /^followup-failed:/);
-  end(2);
-  assert.equal(sink.length, 1, "额度没被烧掉，下一次异常仍然能续");
+  assert.equal(after.continued, 1);
+  assert.deepEqual(after.attempts, { sT: 1 }, "只算一次续跑额度");
+  assert.equal(after.lastSkip, null, "重试成功后 lastSkip 应清空");
+}
+
+// 21b) 投递持续失败：重试有上界（= maxRetries）、始终不烧额度、保留最后一条 lastSkip
+{
+  let tries = 0;
+  const ctx = makeCtx(() => ({
+    followup: () => {
+      tries += 1;
+      throw new Error("boom");
+    },
+  }));
+  apply(ctx, configWith({ maxRetries: 2 }));
+  ctx._emit("session/event", { header: { id: "sF" } }, turnEndEvent(1, { kind: "error" }));
+  assert.equal(tries, 3, "1 次首发 + 2 次重试（上界与 maxRetries 同源）");
+  const body = await statusOf(ctx);
+  assert.equal(body.continued, 0);
+  assert.deepEqual(body.attempts, {}, "失败始终不烧额度");
+  assert.match(String(body.lastSkip?.reason), /^followup-failed:/);
 }
 
 // 22) cause 认不出来（abort 的 cause 缺失/形态不认识）只续 1 次；completed 后机会归还
@@ -459,16 +500,10 @@ for (const reason of [
   end(4, noCause);
   assert.equal(sink.length, 2, "completed 之后机会应归还");
 
-  // 已知 cause 不受这条限制：仍走 maxRetries（第 2 次起走退避，用假定时器 flush）
-  const timers = captureTimers();
-  try {
-    end(5, { kind: "error" }); // count=2 → 排退避
-    timers.flushAll();
-    end(6, { kind: "error" }); // count=3 → 再排一次（上一次已 flush，pending 已清）
-    timers.flushAll();
-  } finally {
-    timers.restore();
-  }
+  // 已知 cause 不受这条限制：仍走 maxRetries（第 2 次起走退避，_emit 会自动排空定时器）
+  end(5, { kind: "error" }); // count=2 → 排退避
+  end(6, { kind: "error" }); // count=3 → 再排一次（上一次已排空，pending 已清）
+  assert.equal(sink.length, 4, "已知 cause 仍按 maxRetries 续");
   assert.equal(sink.length, 4, "已知 cause 仍按 maxRetries 续");
 
   // 宿主以后新增的**有名字**的 cause 不在这条路上：它不在 causes 名单里 → 一次都不续（fail-closed）
@@ -513,6 +548,53 @@ for (const reason of [
   assert.equal((await call("127.0.0.1:19387")).status, 200);
   assert.equal((await call("localhost")).status, 200);
   assert.equal((await call("[::1]:19387")).status, 200);
+}
+
+// 25) ★ 回归：投递必须逃出 session append 的派发栈
+//     宿主在 Session.commit() 里同步派发 session/event（此刻 entry.appending 仍为 true），
+//     此时任何 session.append（含 followup → send → inbox.splice）都会从 followup 抛出：
+//       "session append cannot reenter while another append is being published"
+//     旧代码直接在观察者里同步投递 → 真实宿主上 seen 一直涨、continued 永远是 0。
+{
+  const sink = [];
+  let inDispatch = false;
+  const agent = {
+    followup: (message) => {
+      if (inDispatch) throw new Error("session append cannot reenter while another append is being published");
+      sink.push(message);
+    },
+  };
+  const ctx = makeCtx(() => agent);
+  apply(ctx, configWith({ maxRetries: 1 }));
+  ctx._noDrain = true;
+  inDispatch = true;
+  try {
+    ctx._emit("session/event", { header: { id: "sBoom" } }, turnEndEvent(1, { kind: "error" }));
+    assert.equal(sink.length, 0, "派发栈里绝不能投（会被宿主的 append 重入保护打回）");
+    assert.equal(timers.captured.length, 1, "应当已排一次延后投递");
+  } finally {
+    inDispatch = false;
+  }
+  ctx._noDrain = false;
+  flush();
+  assert.equal(sink.length, 1, "派发结束之后应当投出去");
+  const body = await statusOf(ctx);
+  assert.equal(body.continued, 1);
+  assert.equal(body.lastSkip, null);
+}
+
+// 26) 卸载即清掉排队的投递：卸载后再补一句「继续」是可见的 bug
+{
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith());
+  ctx._noDrain = true;
+  ctx._emit("session/event", { header: { id: "sD" } }, turnEndEvent(1, { kind: "error" }));
+  assert.equal(timers.captured.length, 1, "应当已排一次投递");
+  ctx._emit("dispose");
+  ctx._noDrain = false;
+  flush();
+  assert.equal(sink.length, 0, "dispose 之后不该再投");
 }
 
 console.log("auto-continue selftest: all assertions passed");

@@ -6,8 +6,9 @@
  * What this pins down (each one has a way of failing silently in production):
  *   · the bundle is a classic script with the right factory id, not an ESM module;
  *   · the browser half requires nothing but platform-seeded packages;
- *   · the card registers into `settings.section` under the loader entry id, and its
- *     nav label goes through the locale (a thunk, so it follows a language switch);
+ *   · the card registers into the Plugins page's `plugins.bundle.config` slot under
+ *     this package's name, and the one-liner it offers for `view: 'summary'` goes
+ *     through the locale;
  *   · the config form is built for the entry with the two volatile fields the host
  *     half reads (`maxRetries`, `retryIntervalMs`) and its actions reach the card;
  *   · the card still renders when the host serves no config form;
@@ -162,16 +163,14 @@ const textOf = node => {
 
 const withForm = makeCtx()
 check('apply() registers the card without throwing', () => { client.apply(withForm.ctx) })
-check('injects into the settings.section slot', () => assert.equal(withForm.state.slot, 'settings.section'))
-check('registers exactly one section', () => assert.equal(withForm.registrations.length, 1))
-check('section id is the loader entry id and the locale namespace follows it', () => {
-  assert.equal(withForm.registrations[0].descriptor.id, 'auto-continue')
+check("injects into the Plugins page's bundle-config slot", () => assert.equal(withForm.state.slot, 'plugins.bundle.config'))
+check('registers exactly one config entry', () => assert.equal(withForm.registrations.length, 1))
+check('entry is keyed by the package name the profile installs', () => {
+  const { descriptor } = withForm.registrations[0]
+  assert.equal(descriptor.name, 'plugins.bundle.config')
+  assert.equal(descriptor.key, 'dsh-auto-continue')
+  assert.equal(descriptor.id, undefined)
   assert.equal(withForm.state.registered.namespace, 'settings.auto-continue')
-})
-check('nav label is a thunk that resolves through the locale', () => {
-  const label = withForm.registrations[0].descriptor.label
-  assert.equal(typeof label, 'function')
-  assert.equal(label(), 'T:row.navLabel')
 })
 check('config form built for the entry with both volatile fields', () => {
   assert.deepEqual(builtFields, ['maxRetries', 'retryIntervalMs'])
@@ -186,8 +185,8 @@ check('descriptor injects the form hook and the save actions', () => {
 })
 
 const snapshot = { writable: true, maxRetries: { name: 'maxRetries', text: '3' }, retryIntervalMs: { name: 'retryIntervalMs', text: '2000' } }
-const render = (registration, useRetryForm) => {
-  const props = { ...registration.descriptor.inject(), t: key => 'T:' + key, locale: 'zh', useRetryForm }
+const render = (registration, useRetryForm, view = 'page') => {
+  const props = { ...registration.descriptor.inject(), t: key => 'T:' + key, locale: 'zh', useRetryForm, view }
   // The descriptor may hand back a wrapper component (the one that subscribes to the
   // form); call through function components until the tree is real elements.
   let node = registration.component(props)
@@ -199,9 +198,15 @@ check('with a form: the card renders the retry fields and the live status', () =
   const tree = render(withForm.registrations[0], selector => selector(snapshot))
   assert.equal(tree.props.className, 'dsm-ac-card')
   const text = textOf(tree)
-  for (const key of ['retry.title', 'retry.maxRetries', 'retry.interval', 'status.title', 'page.title']) {
+  for (const key of ['retry.title', 'retry.maxRetries', 'retry.interval', 'status.title']) {
     assert.ok(text.includes('T:' + key), 'missing ' + key)
   }
+  assert.equal(text.includes('T:row.summary'), false, 'the one-liner belongs to the summary view only')
+})
+
+check('the summary view is one locale-driven line, not the card', () => {
+  const summary = render(withForm.registrations[0], selector => selector(snapshot), 'summary')
+  assert.equal(summary, 'T:row.summary')
 })
 
 const withoutForm = makeCtx({ formService: false })

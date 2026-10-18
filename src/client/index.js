@@ -1,8 +1,10 @@
 /**
- * Browser half: the dsh-auto-continue card under Settings.
+ * Browser half: the dsh-auto-continue card on its own page in the Plugins page.
  *
  * DSH renders no generic config form for a third-party plugin entry, so the two
- * retry knobs get a card of their own. The values are the loader entry's volatile
+ * retry knobs get a card of their own, registered into `plugins.bundle.config` under
+ * this package's name — the slot the Plugins page renders on the bundle's own page
+ * (the Settings nav is left untouched). The values are the loader entry's volatile
  * fields (`maxRetries`, `retryIntervalMs`), written through the host's own settings
  * form model — the same path the built-in cards use, so saves are revision-checked
  * and persisted by the host rather than by this plugin.
@@ -34,7 +36,7 @@ const name = 'dsh-auto-continue-client'
  *
  * Only services present on every host line may be named here: cordis' gate is hard,
  * and an inject entry the running line does not provide keeps `apply` from ever
- * running. The settings surface is reached through `ctx.get()` inside `apply`.
+ * running. The config-form service is reached through `ctx.get()` inside `apply`.
  */
 const inject = ['slots', 'locale']
 
@@ -43,6 +45,14 @@ const SETTINGS_NS = 'auto-continue'
 
 /** Host plugin entry id, used to find this plugin's config form. */
 const ENTRY_ID = 'auto-continue'
+
+/**
+ * This card's key in the Plugins page's `plugins.bundle.config` slot.
+ *
+ * That page keys the slot by the bundle's package name — the name the profile lists
+ * in `dsh.profile.bundles` — and renders the occupant on the bundle's own page.
+ */
+const BUNDLE_KEY = 'dsh-auto-continue'
 
 /** Plugin-owned status route. Mirrored from lib/index.js. */
 const STATUS_PATH = '/_auto-continue/status'
@@ -55,9 +65,7 @@ const STYLE_ID = 'dsh-auto-continue-client-css'
 const ROOT_CLASS = 'dsm-ac-card'
 
 const zh = {
-  'row.navLabel': '自动继续',
-  'page.title': '自动继续',
-  'page.hint': '会话被非正常中断（崩溃、父级停止、归档、未知原因）时自动补一句「继续」，把任务接着跑；用户自己点的终止一律不动。',
+  'row.summary': '异常中断后自动补一句「继续」；用户自己点的终止一律不动。',
   'retry.title': '重试参数',
   'retry.hint': '写入本插件的设置，优先级高于 loader 里的 rules。重试次数按 30 分钟窗口累计；间隔是第 2 次起的退避起点（×2 递增、±30% 抖动、上限 30 秒），第 1 次投递总是立即进行。',
   'retry.maxRetries': '重试次数',
@@ -85,9 +93,7 @@ const zh = {
 }
 
 const en = {
-  'row.navLabel': 'Auto continue',
-  'page.title': 'Auto continue',
-  'page.hint': 'Appends a "continue" turn after an abnormal interruption (crash, parent stop, archive, unknown cause) so the task keeps going. A stop you triggered yourself is never touched.',
+  'row.summary': 'Appends a "continue" turn after an abnormal interruption; a stop you triggered yourself is never touched.',
   'retry.title': 'Retry settings',
   'retry.hint': 'Stored in this plugin\'s settings, and they outrank the loader\'s rules. The count is per 30-minute window; the interval is the backoff base from the 2nd delivery on (doubles, ±30% jitter, 30s cap). The first delivery is always immediate.',
   'retry.maxRetries': 'Retries',
@@ -231,13 +237,20 @@ function StatusCard(props) {
   )
 }
 
-/** The card. Renders with or without the config form the host may serve. */
+/**
+ * The card: the retry form plus the live status in the `page` view, one locale-driven
+ * line in the `summary` view the Plugins page asks for when the bundle has no
+ * description of its own. Renders with or without the config form. The hook order is
+ * fixed — the summary view is a branch after them, never a second component.
+ */
 function AutoContinueCard(props) {
   const { t, form } = props
+  const summary = props.view === 'summary'
   const [status, setStatus] = React.useState(null)
   // The card is the only reader of the status document, so the interval is owned
-  // here and torn down with the component.
+  // here and torn down with the component. The summary view never needs it.
   React.useEffect(() => {
+    if (summary) return undefined
     let alive = true
     const read = async () => {
       try {
@@ -252,10 +265,9 @@ function AutoContinueCard(props) {
     void read()
     const timer = setInterval(read, POLL_INTERVAL_MS)
     return () => { alive = false; clearInterval(timer) }
-  }, [])
+  }, [summary])
+  if (summary) return t('row.summary')
   return h('div', { className: ROOT_CLASS },
-    h('h2', { className: 'dsm-ac-title' }, t('page.title')),
-    h('p', { className: 'dsm-ac-hint' }, t('page.hint')),
     form === undefined
       ? h('div', { className: 'dsm-ac-block' }, h('p', { className: 'dsm-ac-hint' }, t('form.unavailable')))
       : h(RetryForm, { ...props, form }),
@@ -310,22 +322,17 @@ function apply(ctx) {
       return retryForm
     }
 
-    // Two-phase registration: `inject` waits for the slot to be declared by the
-    // settings shell, which is what lets this card land in the left nav. The slot and
-    // the config-form service both come from that shell, so by the time this callback
-    // runs the form is normally there — and the component is chosen here, once,
-    // because a subscription hook may not appear or vanish between renders.
-    ctx.slots.inject('settings.section', () => {
+    // Two-phase registration: `inject` waits for the Plugins page to declare the
+    // slot. That page keys it by the bundle's package name and renders the occupant on
+    // the bundle's own page, so the Settings nav stays untouched. The component is
+    // chosen here, once, because a subscription hook may not appear or vanish between
+    // renders.
+    ctx.slots.inject('plugins.bundle.config', () => {
       const form = resolveRetryForm()
       return ctx.slots.register({
-        name: 'settings.section',
-        id: SETTINGS_NS,
-        // After the built-in pages (General 0 / Models 10 / Plugins 15 / presets 20
-        // / market 40) so this sits with the other community pages.
-        order: 460,
-        // A thunk, not a resolved string: the shell re-reads it on every projection,
-        // so the nav row follows a locale change.
-        label: () => t('row.navLabel'),
+        name: 'plugins.bundle.config',
+        key: BUNDLE_KEY,
+        locale: namespace,
         inject: () => form === undefined
           ? { t }
           : { t, hooks: { retryForm: form.store }, ...form.actions },
@@ -336,4 +343,4 @@ function apply(ctx) {
   }
 }
 
-module.exports = { name, inject, apply, __test: { zh, en, ROOT_CLASS, STATUS_PATH, ENTRY_ID } }
+module.exports = { name, inject, apply, __test: { zh, en, ROOT_CLASS, STATUS_PATH, ENTRY_ID, BUNDLE_KEY } }

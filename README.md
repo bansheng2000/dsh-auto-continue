@@ -53,6 +53,14 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 投递抛错不烧续跑额度，但会按同一退避阶梯**有界重试**（上界 = `maxRetries`，免得持续失败变成热循环），
 重试时重新取一次 agent（这几百毫秒里会话可能已被 dispose）。
 
+**看门狗（默认关，`rules.watchdogMinutes`）**补的是事件路径够不着的那一类：上游流在 completion 之前断掉时，
+宿主既不抛错也不落 `turn/end`，轮次悬在半空——`turn/end` 永远不来，判定逻辑再准也无从触发
+（2026-10-14 10:49 实测，UI 报 `upstream stream ended before a completion event / this turn may be incomplete`）。
+打开后：`turn/start` 武装、轮次内任何事件都算心跳、静默超过 N 分钟补一句「继续」
+（走同一份额度、一轮只补一次、补完等下一次 `turn/start` 重新武装；额度用尽记 `watchdog-out-of-quota`）。
+代价是**长轮次会被误判**——跑测试、跑备份、下大文件本来就会静默很久，补错了就是多烧一轮 LLM 调用、
+甚至和还活着的那一轮打架。所以默认关，只在你确知自己的轮次都很短时才开。
+
 消息自己造，形状与宿主 `createUserMessage` 一致（`deepFreeze(structuredClone({id, role:'user', content, source}))`），
 不为此引入 `@deepseek-ai/dsh-llm` 依赖。
 
@@ -74,6 +82,7 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 | `rules.kinds` | `["error","interrupted","max-tokens"]` | 哪些非 aborted 的 turn/end reason 算异常；写 `[]` = 全禁 |
 | `rules.prompt` | `"继续"` | 补发的那句话（去首尾空白；超长截断到 2000 字符） |
 | `rules.maxRetries` | `3` | 同一会话最多自动续几次（计数按 30 分钟窗口累计、`completed` 时归零），防 runaway |
+| `rules.watchdogMinutes` | `0`（关） | 看门狗：会话「运行中且静默」超过这么多分钟就补一句「继续」；`0` = 关 |
 
 `user` 恒不算异常——这是需求的第一条，不提供开关。
 空数组 = 全禁（**不是**「回落默认」）：不写这个键才用默认名单，两者含义不同。
@@ -85,7 +94,8 @@ cause 认不出来（`unknown`，即 abort 的 cause 字段缺失或形态不认
 
 ## 状态查询
 
-`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, attempts }`。
+`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, attempts, watchdog }`。
+`watchdog` = `{ minutes, watching, fires, lastFireAt }`（`watching` = 当前武装中的轮次数，即「运行中且有心跳」的会话数）。
 `seen`/`lastSeen` 是观测口：宿主每发一个 `turn/end` 就计数、记下 `sessionId/turn/reason`，
 用来证明监听确实挂上了（而不是判定把事件放过了）。
 `lastSkip` 记「本该续但没续」的原因（投递成功/重试成功后清空）（`no-live-agent` / `agent-has-no-followup` /
@@ -111,6 +121,9 @@ cloudflared 隧道会把公网请求以 `127.0.0.1` 送达（`remoteAddress` 因
 4. **是不是额度挡住了**：`attempts` 里该会话的计数到 `maxRetries` 就不再续；计数按 30 分钟窗口累计，
    会话正常收轮（`completed`）时归零。
 5. `cause=user`（用户自己点的终止）**不会**续——这是设计，不是故障。
+6. **`seen` 压根不涨、UI 却报「upstream stream ended before a completion event」**：那一轮根本没走到收尾
+   （传输层猝死），`turn/end` 从没落地——事件路径结构上够不着。只能开看门狗（`rules.watchdogMinutes`），
+   或者到宿主/模型网关那一层加重试。
 
 ## 安装
 
@@ -152,3 +165,4 @@ enabled=false、自定义 `causes`、畸形 payload、多会话隔离、
 投递失败自动重试（成功即清 `lastSkip`；持续失败时有界重试、不烧额度）、
 **投递必须逃出 append 派发栈**（回归用例：派发栈内 followup 抛重入错误时，第 1 次投递仍是延后 0ms 排队的）、
 dispose 清掉排队中的投递。
+看门狗默认关（连节拍都不建）、打开后静默超时补一次并受同一份额度约束。

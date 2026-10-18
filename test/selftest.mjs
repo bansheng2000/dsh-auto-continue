@@ -17,18 +17,30 @@ assert.ok(mod.inject.includes("agents"), "inject 必须声明 agents（ctx.agent
 function installTimerCapture() {
   const realSetTimeout = globalThis.setTimeout;
   const realClearTimeout = globalThis.clearTimeout;
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
   const captured = [];
+  const intervals = [];
   const cancelled = new Set();
   globalThis.setTimeout = (fn, ms) => {
     const handle = { fn, ms, unref() {} };
     captured.push(handle);
     return handle;
   };
+  globalThis.setInterval = (fn, ms) => {
+    const handle = { fn, ms, unref() {} };
+    intervals.push(handle);
+    return handle;
+  };
   globalThis.clearTimeout = (handle) => {
+    if (handle !== undefined && handle !== null) cancelled.add(handle);
+  };
+  globalThis.clearInterval = (handle) => {
     if (handle !== undefined && handle !== null) cancelled.add(handle);
   };
   return {
     captured,
+    intervals,
     flushAll: () => {
       for (;;) {
         const index = captured.findIndex((h) => !cancelled.has(h));
@@ -37,15 +49,26 @@ function installTimerCapture() {
         handle.fn();
       }
     },
+    /** 手动推一次节拍（setInterval 的回调），随后排空它排出来的投递。 */
+    tickIntervals: () => {
+      for (const handle of intervals) if (!cancelled.has(handle)) handle.fn();
+    },
     restore: () => {
       globalThis.setTimeout = realSetTimeout;
       globalThis.clearTimeout = realClearTimeout;
+      globalThis.setInterval = realSetInterval;
+      globalThis.clearInterval = realClearInterval;
     },
   };
 }
 
 const timers = installTimerCapture();
 const flush = () => timers.flushAll();
+/** 推进一拍看门狗节拍，再排空它排出来的投递。 */
+const tick = () => {
+  timers.tickIntervals();
+  timers.flushAll();
+};
 
 /** 造一个最小 ctx：只有 on / inject / agents / logger（inject 只实现 webServer 路由那一种）。 */
 function makeCtx(agentsGet) {
@@ -595,6 +618,67 @@ for (const reason of [
   ctx._noDrain = false;
   flush();
   assert.equal(sink.length, 0, "dispose 之后不该再投");
+}
+
+// 27) 看门狗默认关：轮次悬着（turn/start 之后没有 turn/end）也不补、连节拍都不建
+{
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith());
+  const realNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  try {
+    ctx._emit("session/event", { header: { id: "sW" } }, { type: "turn/start", data: { turn: 1 } });
+    now += 10 * 60_000;
+    tick();
+    assert.equal(timers.intervals.length, 0, "默认关：连节拍都不该建");
+    assert.equal(sink.length, 0, "默认关：轮次悬着也不补");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+// 28) 看门狗打开：静默超时补一条；一轮只补一次；心跳免疫；额度用尽不再补
+{
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith({ maxRetries: 1, watchdogMinutes: 1 }));
+  const realNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  try {
+    const start = () =>
+      ctx._emit("session/event", { header: { id: "sW" } }, { type: "turn/start", data: { turn: 1 } });
+    start();
+    assert.equal(timers.intervals.length, 1, "打开后才建节拍");
+    tick();
+    assert.equal(sink.length, 0, "还没到超时线，不补");
+    // 轮次里的任何事件都算「还活着」
+    now += 30_000;
+    ctx._emit("session/event", { header: { id: "sW" } }, { type: "step/start", data: { step: 2 } });
+    now += 30_000;
+    tick();
+    assert.equal(sink.length, 0, "有心跳就不算静默");
+    now += 61_000;
+    tick();
+    assert.equal(sink.length, 1, "静默超时应当补一条");
+    tick();
+    assert.equal(sink.length, 1, "同一轮只补一次（心跳已摘除）");
+    const body = await statusOf(ctx);
+    assert.deepEqual(body.attempts, { sW: 1 }, "看门狗补发也走同一份额度");
+    assert.equal(body.watchdog.fires, 1);
+    assert.equal(body.watchdog.watching, 0);
+    assert.equal(body.watchdog.minutes, 1);
+    // 新轮次重新武装，但额度已用尽 → 不再补
+    start();
+    now += 61_000;
+    tick();
+    assert.equal(sink.length, 1, "额度用尽后看门狗不再补");
+    assert.equal((await statusOf(ctx)).lastSkip.reason, "watchdog-out-of-quota");
+  } finally {
+    Date.now = realNow;
+  }
 }
 
 console.log("auto-continue selftest: all assertions passed");

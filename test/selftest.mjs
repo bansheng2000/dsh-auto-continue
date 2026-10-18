@@ -1,9 +1,11 @@
 // auto-continue 的自检：不连 DSH 宿主，用假 ctx / 假 agent 验证判定与投递逻辑。
 // 跑法: node test/selftest.mjs
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const mod = await import("../lib/index.js");
-const { apply, rulesOf, resolveConfig } = mod;
+const { apply, rulesOf, resolveConfig, PLUGIN_SOURCE } = mod;
 
 // 0) 必须在 inject 里声明 agents，否则宿主 ctx 上根本没有 ctx.agents —— 续不了。
 assert.ok(mod.inject.includes("agents"), "inject 必须声明 agents（ctx.agents 才会存在）");
@@ -198,7 +200,9 @@ function configWith(overrides = {}) {
   const message = sink[0];
   assert.equal(message.role, "user");
   assert.deepEqual(message.content, [{ type: "text", text: "继续" }]);
-  assert.deepEqual(message.source, { kind: "plugin", plugin: "auto-continue" });
+  // format v4：source.kind 由生产者自报，且不能是退役的裸 "plugin"。
+  assert.deepEqual(message.source, { kind: "plugin:dsh-auto-continue" });
+  assert.equal(message.source.plugin, undefined, "退役的并列 plugin 字段不得再出现");
   assert.equal(typeof message.id, "string");
   assert.ok(message.id.length > 0);
   assert.throws(() => {
@@ -681,4 +685,28 @@ for (const reason of [
   }
 }
 
+// 29) format v4 的 source 准入：退役形状被拒、PLUGIN_SOURCE 过准入、lib/ 里不得再有退役写法
+{
+  // 复刻宿主 @deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js:124-127 的 source()。
+  const admits = (message) => {
+    const value = message?.source;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    if (typeof value.kind !== "string" || value.kind.length === 0) return false;
+    return value.kind !== "plugin";
+  };
+  assert.equal(admits({ source: { kind: "plugin", plugin: "auto-continue" } }), false, "退役的 plugin 包裹必须被拒");
+  assert.equal(admits({ source: { kind: "" } }), false, "空 kind 必须被拒");
+  assert.equal(admits({ source: "plugin" }), false, "非对象 source 必须被拒");
+  assert.equal(admits({ source: PLUGIN_SOURCE }), true, "PLUGIN_SOURCE 必须过 v4 准入");
+  assert.equal(PLUGIN_SOURCE.kind, "plugin:dsh-auto-continue", "插件 source 用 plugin:<包名>");
+  assert.equal(Object.isFrozen(PLUGIN_SOURCE), true, "PLUGIN_SOURCE 应冻结");
+
+  const raw = readFileSync(fileURLToPath(new URL("../lib/index.js", import.meta.url)), "utf8");
+  // 先剥注释再扫：注释里为了讲清规则会引用退役写法，不剥会让断言假绿/假红。
+  const code = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  assert.equal(/kind:\s*["']plugin["']\s*,/.test(code), false, "lib/ 里不得再写 { kind: \"plugin\", … }");
+  assert.ok(/plugin:dsh-auto-continue/.test(code), "lib/ 里必须写明 plugin:<包名>");
+}
+
 console.log("auto-continue selftest: all assertions passed");
+

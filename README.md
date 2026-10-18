@@ -64,6 +64,21 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 消息自己造，形状与宿主 `createUserMessage` 一致（`deepFreeze(structuredClone({id, role:'user', content, source}))`），
 不为此引入 `@deepseek-ai/dsh-llm` 依赖。
 
+**`source` 必须由生产者自报**（会话 format v4 的硬规则，DSH ≥ 0.1.7-rc.2 起强制）：`source.kind`
+要非空、且不能是 `"plugin"`；第三方插件写 `plugin:<包名>`，本插件走常量 `PLUGIN_SOURCE`
+（`{ kind: "plugin:dsh-auto-continue" }`）。v3 时代的 `{ kind: "plugin", plugin: "auto-continue" }` 已退役：
+读历史会话时由 v3→v4 迁移器改写成 `plugin:auto-continue`（迁移器的既定产物），但运行时**新注入**这种形状
+会被直接拒掉，报错原文：
+
+```
+SessionFormatError: format v4 message requires a producer-owned source kind
+```
+
+施加点是 `assertV4SourceRowAdmission`（`@deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js:124-127`），
+作用在 `agent/inbox/spliced` 行的 `inserted` 消息上；而注入正好走
+`followup → send → inbox.splice → append("agent/inbox/spliced")`，所以报错发生在 append 那一刻，
+被 `deliver()` 的 catch 记成 `lastSkip: "followup-failed: …"` —— 症状还是「`seen` 涨、`continued` 恒 0」。
+
 拿 agent 的姿势有个硬要求：**`agents` 必须写进插件导出的 `inject`**（本插件是 `const inject = ["agents"]`），
 否则宿主 ctx 上根本没有 `ctx.agents`，`ctx.agents?.get?.(id)` 恒为 `undefined`，
 每次异常都停在「no live agent」，表现就是「中断了没有发继续」。
@@ -113,10 +128,12 @@ cloudflared 隧道会把公网请求以 `127.0.0.1` 送达（`remoteAddress` 因
 「中断了没自动继续」按这个顺序查，每一步都能自己验证：
 
 1. **插件挂没挂**：`curl http://127.0.0.1:<宿主 web 端口>/_auto-continue/status`
-   （端口以宿主**实际监听**为准——本机当前是 65483，写死 19387 只在旧宿主上成立）。没响应就是没挂上
+   （端口以宿主**实际监听**为准——每次重启都可能变，写死某个旧端口是常见的自欺）。没响应就是没挂上
    （查安装那节的 `- insert:` 坑与「必须重启宿主」）——此时事件监听根本没建立，判定逻辑无从谈起。
 2. **事件进来没有**：`seen` 每来一个 `turn/end` 就 +1。一直不动说明监听没挂上，或宿主改了事件名。
-3. **为什么没续**：看 `lastSkip`。`no-live-agent` = 那一刻拿不到 agent（宿主进程刚崩、或会话已 dispose，
+3. **为什么没续**：看 `lastSkip`。若它记 `followup-failed: SessionFormatError: format v4 message requires
+   a producer-owned source kind`，说明注入用的 `source` 形状退回了退役写法（见上面「继续的投递口」一节）——
+   投递在 append 那一刻就被拒了，跟判定逻辑无关。`no-live-agent` = 那一刻拿不到 agent（宿主进程刚崩、或会话已 dispose，
    插件结构上盖不住这类中断——它不会新建 agent）；`followup-failed:` 后面跟着投递时的原始错误。
 4. **是不是额度挡住了**：`attempts` 里该会话的计数到 `maxRetries` 就不再续；计数按 30 分钟窗口累计，
    会话正常收轮（`completed`）时归零。
@@ -184,4 +201,5 @@ enabled=false、自定义 `causes`、畸形 payload、多会话隔离、
 投递失败自动重试（成功即清 `lastSkip`；持续失败时有界重试、不烧额度）、
 **投递必须逃出 append 派发栈**（回归用例：派发栈内 followup 抛重入错误时，第 1 次投递仍是延后 0ms 排队的）、
 dispose 清掉排队中的投递。
+format v4 的 source 准入（退役的 `{ kind: "plugin", … }` 被拒、`PLUGIN_SOURCE` 过准入且冻结、lib/ 静态扫描无退役写法）。
 看门狗默认关（连节拍都不建）、打开后静默超时补一次并受同一份额度约束。

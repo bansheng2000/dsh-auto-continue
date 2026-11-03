@@ -139,7 +139,8 @@ async function statusOf(ctx) {
   assert.ok(route !== undefined, "应当注册 /_auto-continue/status");
   const calls = [];
   await route.handler(
-    { method: "GET", headers: { host: "127.0.0.1:19387" } },
+    // 路由双重校验：Host 与 peer 地址都得是回环，所以假请求两样都给。
+    { method: "GET", headers: { host: "127.0.0.1:19387" }, socket: { remoteAddress: "127.0.0.1" } },
     { writeHead: (status) => calls.push(status), end: (body) => calls.push(JSON.parse(body)) },
   );
   assert.equal(calls[0], 200, "状态路由应当回 200");
@@ -263,6 +264,52 @@ for (const reason of [
   assert.equal(sink.length, 0, "自定义 kinds 之外的 kind 不补");
   await ctx._emit("session/event", { header: { id: "s1" } }, turnEndEvent(2, { kind: "error", error: { message: "502" } }));
   assert.equal(sink.length, 1, "kinds 里的 error 应补");
+}
+
+// 6c) 终局错误不续跑：重发同一句话必然同样失败（模型没了 / 上下文超了 / 鉴权/额度）
+//     不投递、不烧额度，lastSkip 记 terminal-error:<code>
+for (const reason of [
+  { kind: "error", error: { message: "context length exceeded", code: "CONTEXT_WINDOW_EXCEEDED" } },
+  { kind: "error", error: { message: 'no adapter registered for provider "x"', code: "NO_ADAPTER" } },
+  { kind: "error", error: { message: "401", code: "AUTH", status: 401 } },
+  // 码不认识、但 provider 给了终局状态码 → 走 status 兜底
+  { kind: "error", error: { message: "402", code: "SOMETHING_NEW", status: 402 } },
+]) {
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith());
+  await ctx._emit("session/event", { header: { id: "sT" } }, turnEndEvent(3, reason));
+  assert.equal(sink.length, 0, `终局错误 ${reason.error.code} 不该补消息`);
+  const status = await statusOf(ctx);
+  assert.match(String(status.lastSkip?.reason), /^terminal-error:/, "lastSkip 应记 terminal-error:");
+  assert.equal(status.continued, 0, "终局错误不烧续跑额度");
+  assert.deepEqual(status.attempts, {}, "终局错误不该记续跑次数");
+}
+
+// 6d) 回归：可恢复 / 未知错误仍然续（终局名单不能一刀切）
+for (const reason of [
+  { kind: "error", error: { message: "429", code: "RATE_LIMIT", status: 429 } },
+  { kind: "error", error: { message: "502", code: "SERVER", status: 502 } },
+  { kind: "error" }, // 无 error 字段：交给 maxRetries 兜底
+]) {
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith());
+  await ctx._emit("session/event", { header: { id: "sR" } }, turnEndEvent(3, reason));
+  assert.equal(sink.length, 1, `${reason.error?.code ?? "无 error 字段"} 应仍然补一条「继续」`);
+}
+
+// 6e) 终局判定不受 rules.kinds 开关影响：kinds 里有 error 也不续终局错误
+{
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith({ kinds: ["error"] }));
+  await ctx._emit(
+    "session/event",
+    { header: { id: "sK" } },
+    turnEndEvent(1, { kind: "error", error: { message: "context", code: "CONTEXT_WINDOW_EXCEEDED" } }),
+  );
+  assert.equal(sink.length, 0, "终局错误即使 kinds 含 error 也不续");
 }
 
 // 7) 非 turn/end 事件被忽略
@@ -457,6 +504,7 @@ for (const reason of [
     {
       method: "POST",
       headers: { host: "127.0.0.1:19387" },
+      socket: { remoteAddress: "127.0.0.1" },
       resume: () => {
         resumed = true;
       },
@@ -470,7 +518,7 @@ for (const reason of [
   // 客户端在应答前断连：writeHead 抛错也不该冒泡（async handler 里的裸抛 = 未捕获 rejection）。
   // 这里只要不抛出去，本用例就算过。
   await route.handler(
-    { method: "GET", headers: { host: "127.0.0.1:19387" } },
+    { method: "GET", headers: { host: "127.0.0.1:19387" }, socket: { remoteAddress: "127.0.0.1" } },
     {
       writeHead: () => {
         throw new Error("client gone");
@@ -584,7 +632,8 @@ for (const reason of [
     const calls = [];
     let drained = false;
     await route.handler(
-      { method: "GET", headers: host === undefined ? {} : { host }, resume: () => (drained = true) },
+      // 回环 peer：本用例只验 Host 那一关，地址关的用例见最后一节。
+      { method: "GET", headers: host === undefined ? {} : { host }, socket: { remoteAddress: "127.0.0.1" }, resume: () => (drained = true) },
       { writeHead: (status) => calls.push(status), end: (json) => calls.push(JSON.parse(json)) },
     );
     return { status: calls[0], drained };
@@ -875,6 +924,139 @@ for (const reason of [
   assert.deepEqual(body3.retry.sources, { maxRetries: "default", retryIntervalMs: "default" });
   assert.equal(body3.retry.maxRetries, 3, "缺省仍是 3 次");
   assert.equal(body3.retry.retryIntervalMs, 2000, "缺省仍是 2000ms");
+}
+
+// 35) 终局错误取消已排队的重试：上一轮 429 排的「继续」不能投进刚撑爆的上下文
+{
+  await flush();
+  timers.prune();
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith());
+  ctx._noDrain = true;
+  const emit = (turn, reason) => ctx._emit("session/event", { header: { id: "sTq" } }, turnEndEvent(turn, reason));
+  await emit(1, { kind: "error", error: { message: "429", code: "RATE_LIMIT", status: 429 } });
+  const queued = await statusOf(ctx);
+  assert.equal(queued.pending, 1, "429 应先排一条投递");
+  assert.equal(queued.inFlight, 0);
+  await emit(2, { kind: "error", error: { message: "context", code: "CONTEXT_WINDOW_EXCEEDED" } });
+  const after = await statusOf(ctx);
+  assert.equal(after.pending, 0, "终局后 pending 必须清空");
+  assert.equal(after.inFlight, 0);
+  assert.equal(after.lastSkip?.reason, "terminal-error:CONTEXT_WINDOW_EXCEEDED");
+  assert.equal(timers.pendingCount(), 0, "终局错误不该再留定时器");
+  await flush();
+  assert.equal(sink.length, 0, "被取消的排队投递不该真的发出去");
+}
+
+// 36) 终局错误作废「已进入投递、正在等 agent 空闲」的那一条（世代校验）
+{
+  await flush();
+  timers.prune();
+  const calls = [];
+  let release;
+  const agent = {
+    status: "running",
+    whenIdle: () => new Promise((resolve) => { release = resolve; }),
+    followup: (message) => { calls.push(message); },
+  };
+  const ctx = makeCtx(() => agent);
+  apply(ctx, configWith());
+  ctx._noDrain = true;
+  const emit = (turn, reason) => ctx._emit("session/event", { header: { id: "sTi" } }, turnEndEvent(turn, reason));
+  await emit(1, { kind: "error", error: { message: "429", code: "RATE_LIMIT", status: 429 } });
+  assert.equal(timers.captured.length, 1, "应当只有那条 0ms 投递");
+  timers.captured.splice(0, 1)[0].fn(); // 只推进投递这一拍，别把等 idle 的 60s 上界也跑掉
+  await drain();
+  assert.equal(typeof release, "function", "投递应当已经卡在 whenIdle 上");
+  assert.equal(calls.length, 0);
+  await emit(2, { kind: "error", error: { message: "context", code: "CONTEXT_WINDOW_EXCEEDED" } });
+  release();
+  await drain();
+  assert.equal(calls.length, 0, "等 idle 期间来的终局必须作废这条投递");
+  await flush();
+}
+
+// 37) 终局打断退避 sleep 后 inFlight 必须摘掉：同会话之后的正常轮次还得能续
+{
+  await flush();
+  timers.prune();
+  const sink = [];
+  let fail = true;
+  const ctx = makeCtx(() => ({
+    followup: (message) => {
+      if (fail) throw new Error("append busy");
+      sink.push(message);
+    },
+  }));
+  apply(ctx, configWith());
+  ctx._noDrain = true;
+  const emit = (turn, reason) => ctx._emit("session/event", { header: { id: "sDr" } }, turnEndEvent(turn, reason));
+  await emit(1, { kind: "error", error: { message: "429", code: "RATE_LIMIT", status: 429 } });
+  timers.flushAll();
+  await drain();
+  assert.ok(timers.pendingCount() >= 1, "投递失败后应当已排退避重试");
+  await emit(2, { kind: "error", error: { message: "context", code: "CONTEXT_WINDOW_EXCEEDED" } });
+  await drain();
+  assert.equal(timers.pendingCount(), 0, "终局应清掉退避定时器");
+  fail = false;
+  await emit(3, { kind: "interrupted" });
+  await flush();
+  assert.equal(sink.length, 1, "终局之后的新轮次仍应能续（inFlight 已释放）");
+}
+
+// 38) HTTP_<status> 兜底形态：HTTP_401 终局；408/429 可恢复，仍续
+for (const [code, continues] of [["HTTP_401", false], ["HTTP_408", true], ["HTTP_429", true]]) {
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith());
+  await ctx._emit("session/event", { header: { id: "sH" } }, turnEndEvent(1, { kind: "error", error: { message: code, code } }));
+  if (continues) {
+    assert.equal(sink.length, 1, `${code} 应当仍可续`);
+  } else {
+    assert.equal(sink.length, 0, `${code} 应当判终局`);
+    assert.equal((await statusOf(ctx)).lastSkip?.reason, "terminal-error:HTTP_401");
+  }
+}
+
+// 39) UNKNOWN 码必须仍可续：未知情况交给 maxRetries 兜底，不能一刀切
+{
+  const sink = [];
+  const ctx = makeCtx(() => makeAgent(sink));
+  apply(ctx, configWith());
+  await ctx._emit("session/event", { header: { id: "sU" } }, turnEndEvent(1, { kind: "error", error: { message: "boom", code: "UNKNOWN" } }));
+  assert.equal(sink.length, 1, "UNKNOWN 不该被当终局");
+}
+
+// 40) maxRetries 写成非数字时回落到默认值 3，而不是静默变成「一次都不续」
+{
+  const ctx = makeCtx(() => makeAgent([]));
+  apply(ctx, configWith({ maxRetries: "3次" }));
+  assert.equal((await statusOf(ctx)).retry.maxRetries, 3, "rules 里的非数字应回落默认");
+
+  const ctx2 = makeCtx(() => makeAgent([]));
+  apply(ctx2, { maxRetries: "3次" });
+  const body = await statusOf(ctx2);
+  assert.equal(body.retry.maxRetries, 3, "设置页里的非数字同样回落默认");
+  assert.equal(body.retry.sources.maxRetries, "setting");
+}
+
+// 41) 状态路由双重校验：Host 与 peer 地址必须都回环
+{
+  const ctx = makeCtx(() => makeAgent([]));
+  apply(ctx, {});
+  const route = ctx._routes.find((r) => r.path === "/_auto-continue/status");
+  const call = async (host, remoteAddress) => {
+    const calls = [];
+    await route.handler(
+      { method: "GET", headers: { host }, socket: { remoteAddress }, resume: () => {} },
+      { writeHead: (status) => calls.push(status), end: (body) => calls.push(JSON.parse(body)) },
+    );
+    return calls[0];
+  };
+  assert.equal(await call("127.0.0.1:52252", "192.168.1.5"), 403, "伪造 Host 但 peer 非回环必须 403");
+  assert.equal(await call("evil.example.com", "127.0.0.1"), 403, "隧道 / DNS rebinding 的 Host 非回环必须 403");
+  assert.equal(await call("127.0.0.1:52252", "::ffff:127.0.0.1"), 200, "IPv4-mapped 回环应放行");
 }
 
 console.log("auto-continue selftest: all assertions passed");

@@ -30,10 +30,21 @@ this.session.append("turn/end", { turn, reason: turnEnds });
 
 | reason.kind | 含义 | 默认动作 |
 |---|---|---|
-| `error` | LLM 报错把轮次打死（429 限流、502 上游失败等） | 续 |
+| `error` | LLM 报错把轮次打死（429 限流、502 上游失败等） | 续；**终局错误不续**（见下） |
 | `interrupted` | 上次进程崩在轮次中途，恢复时补的 turn closer | 续 |
 | `max-tokens` | 输出被截断，任务没做完 | 续 |
 | `completed` / `blocked` / `forked` | 正常完成 / 权限或 hook 拦下 / 用户分叉 | **不管** |
+
+`error` 里有一类**终局错误**：发「继续」只会原样再失败一次（模型被摘掉、上下文撑爆、鉴权/额度问题），
+所以不投递、**不烧续跑额度**，只在 `lastSkip` 记 `terminal-error:<code>` 并打一行 warn。判定照宿主自己的
+重试白名单取反：`CONTEXT_WINDOW_EXCEEDED` / `QUOTA` / `ACCOUNT_QUOTA` / `AUTH` / `MISSING_CREDENTIAL` /
+`INVALID_CREDENTIAL` / `INVALID_REQUEST` / `INVALID_ARGS` / `NO_ADAPTER`，以及 `error.status` ∈
+`{400,401,402,403,404,413,422}`、`HTTP_4xx`（408/429 除外）。`UNKNOWN` / 没有 `code` / 没有 `error` 字段
+仍按可续处理，交给 `maxRetries` 兜底——未知情况一刀切会把真正可恢复的抖动也静默吞掉。
+
+终局错误到达时会**把该会话排队中/在途的「继续」一起作废**：清掉 `pending` 里的定时器、唤醒退避
+sleep（否则 `inFlight` 摘不掉，这个会话之后再也排不进投递）、并用投递世代号让「已经卡在等 idle」
+的那一条在真正 `followup` 前放弃。否则上一轮 429 排的 2 秒退避会把一句「继续」投进刚撑爆的上下文里。
 
 ## 继续的投递口
 
@@ -102,7 +113,7 @@ SessionFormatError: format v4 message requires a producer-owned source kind
 |---|---|---|
 | `rules.enabled` | `true` | 装上即生效；关掉后只留状态查询 |
 | `rules.causes` | `["parent","disposed","legacy","unknown"]` | 哪些 abort cause 算异常；写 `[]` = 全禁 |
-| `rules.kinds` | `["error","interrupted","max-tokens"]` | 哪些非 aborted 的 turn/end reason 算异常；写 `[]` = 全禁 |
+| `rules.kinds` | `["error","interrupted","max-tokens"]` | 哪些非 aborted 的 turn/end reason 算异常；写 `[]` = 全禁。终局错误不受它管（见上） |
 | `rules.prompt` | `"继续"` | 补发的那句话（去首尾空白；超长截断到 2000 字符） |
 | `rules.maxRetries` | `3` | 同一会话最多自动续几次（计数按 30 分钟窗口累计、`completed` 时归零），防 runaway |
 | `rules.watchdogMinutes` | `0`（关） | 看门狗：会话「运行中且静默」超过这么多分钟就补一句「继续」；`0` = 关 |
@@ -145,20 +156,22 @@ pnpm run build      # 改过 src/client/ 必须重跑；lib/client.js 是产物�
 
 ## 状态查询
 
-`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, attempts, retry, watchdog }`。
+`GET /_auto-continue/status` → `{ active, continued, seen, lastSeen, lastReason, lastSkip, pending, inFlight, attempts, retry, watchdog }`。
+`pending` = 排队中的投递条数（含退避 sleep），`inFlight` = 正在投的条数；设置页的「排队中」读前者。
 `retry` = `{ maxRetries, retryIntervalMs, sources }`（`sources` 标出每个值来自 `rules` / 配置界面 `setting` / `default`）。
 `watchdog` = `{ minutes, watching, fires, lastFireAt }`（`watching` = 当前武装中的轮次数，即「运行中且有心跳」的会话数）。
 `seen`/`lastSeen` 是观测口：宿主每发一个 `turn/end` 就计数、记下 `sessionId/turn/reason`，
 用来证明监听确实挂上了（而不是判定把事件放过了）。
 `lastSkip` 记「本该续但没续」的原因（投递成功/重试成功后清空）（`no-live-agent` / `agent-has-no-followup` /
 `no-live-agent-on-retry` / `already-scheduled` / `unknown-cause-already-continued` /
-`followup-failed: …`）——没有这个字段时，「中断没续」只能靠猜。
+`followup-failed: …` / `terminal-error:<code>`）——没有这个字段时，「中断没续」只能靠猜。
 路由按宿主 `WebRoute` 契约注册：`{ kind: "exact", path, handler(req, res) }`，
 raw node http，`res.writeHead()/res.end()`。
-**只服务回环**：Host 头不是 `127.0.0.1` / `localhost` / `::1` 一律 403。这条路由是用
-`ctx.webServer.register` 裸注册的，不在宿主 `/api/*` 的浏览器鉴权墙后面，而本机常驻的
-cloudflared 隧道会把公网请求以 `127.0.0.1` 送达（`remoteAddress` 因此不可信），
-所以只能自己按 Host 头把关。
+**只服务回环，两道校验都过才放行**：Host 头必须是 `127.0.0.1` / `localhost` / `::1`，**并且**
+`req.socket.remoteAddress` 必须是 `127.0.0.1` / `::1` / `::ffff:127.0.0.1`，否则一律 403。
+这条路由是用 `ctx.webServer.register` 裸注册的，不在宿主 `/api/*` 的浏览器鉴权墙后面：Host 这一道挡
+cloudflared 隧道与 DNS rebinding（隧道的 peer 是 127.0.0.1，只查地址会漏）；peer 地址这一道挡同网段直连
+（宿主可能监听 `0.0.0.0`，而 Host 头是客户端自己写的，伪造成 `127.0.0.1` 就能过）。
 
 ## 故障排查
 
